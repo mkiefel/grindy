@@ -4,7 +4,8 @@
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{self, Pull};
-use embassy_time::{Delay, Duration, Instant};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
+use embassy_time::{Delay, Duration, Instant, Timer};
 use gpio::{Input, Level, Output};
 use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
@@ -18,22 +19,46 @@ enum GrinderState {
     WaitingForRemoval,
 }
 
-#[unsafe(link_section = ".bi_entries")]
-#[used]
-pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
-    embassy_rp::binary_info::rp_program_name!(c"Grindy"),
-    embassy_rp::binary_info::rp_program_description!(
-        c"Runs a grinder by weight."
-    ),
-    embassy_rp::binary_info::rp_cargo_version!(),
-    embassy_rp::binary_info::rp_program_build_attribute!(),
-];
+static STATE_WATCH: Watch<CriticalSectionRawMutex, GrinderState, 1> = Watch::new();
+
+#[embassy_executor::task]
+async fn led_task(mut led: Output<'static>) {
+    let mut state_receiver = STATE_WATCH.receiver().unwrap();
+    loop {
+        match state_receiver.get().await {
+            GrinderState::WaitingForPortafilter => {
+                led.set_high();
+                Timer::after(Duration::from_millis(1000)).await;
+                led.set_low();
+                Timer::after(Duration::from_millis(1000)).await;
+            }
+            GrinderState::Stabilizing => {
+                led.set_high();
+                Timer::after(Duration::from_millis(250)).await;
+                led.set_low();
+                Timer::after(Duration::from_millis(250)).await;
+            }
+            GrinderState::Grinding => {
+                led.set_high();
+                state_receiver.changed().await;
+            }
+            GrinderState::WaitingForRemoval => {
+                led.set_high();
+                Timer::after(Duration::from_millis(100)).await;
+                led.set_low();
+                Timer::after(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut grinder = Output::new(p.PIN_0, Level::High);
+
+    let led = Output::new(p.PIN_25, Level::Low);
 
     let dt = Input::new(p.PIN_17, Pull::Down);
     let sck = Output::new(p.PIN_16, Level::Low);
@@ -67,6 +92,10 @@ async fn main(_spawner: Spawner) {
     // Tolerance for weight stability (grams).
     const WEIGHT_STABILITY_TOLERANCE: f32 = 0.5;
 
+    _spawner.spawn(led_task(led)).unwrap();
+    let state_sender = STATE_WATCH.sender();
+    state_sender.send(state);
+
     info!("Hello, coffee world!");
     info!("Grindy is ready - waiting for portafilter...");
 
@@ -88,6 +117,7 @@ async fn main(_spawner: Spawner) {
                             rounded_weight
                         );
                         state = GrinderState::Stabilizing;
+                        state_sender.send(state);
                         stabilization_start = Some(Instant::now());
                         portafilter_weight = avg_weight;
                     }
@@ -101,6 +131,7 @@ async fn main(_spawner: Spawner) {
                         // Portafilter removed during stabilization
                         info!("Portafilter removed during stabilization - waiting for placement");
                         state = GrinderState::WaitingForPortafilter;
+                        state_sender.send(state);
                         stabilization_start = None;
                         portafilter_weight = 0.0;
                     } else if weight_diff > WEIGHT_STABILITY_TOLERANCE {
@@ -115,6 +146,7 @@ async fn main(_spawner: Spawner) {
                         if Instant::now() - start_time >= STABILIZATION_TIME {
                             info!("Weight stabilized at {}g - starting grind!", rounded_weight);
                             state = GrinderState::Grinding;
+                            state_sender.send(state);
                             grinder.set_low();
                             grind_start = Some(Instant::now());
                         }
@@ -140,6 +172,7 @@ async fn main(_spawner: Spawner) {
                         grinder.set_high();
                         grind_start = None;
                         state = GrinderState::WaitingForRemoval;
+                        state_sender.send(state);
                         info!(
                             "Waiting for portafilter removal... Current weight: {}g",
                             rounded_weight
@@ -151,11 +184,14 @@ async fn main(_spawner: Spawner) {
                     if avg_weight < REMOVAL_THRESHOLD {
                         info!("Portafilter removed - ready for next cycle");
                         state = GrinderState::WaitingForPortafilter;
+                        state_sender.send(state);
                         stabilization_start = None;
                         portafilter_weight = 0.0;
                     }
                 }
             }
         }
+        // Let other tasks run.
+        Timer::after(Duration::from_millis(50)).await;
     }
 }

@@ -17,6 +17,7 @@ panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 loadcell = "0.3.0"
 heapless = "0.8.0"
 num-traits = { version = "0.2.19", default-features = false }
+embassy-sync = "0.7.2"
 
 [[bin]]
 name = "grindy"
