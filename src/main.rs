@@ -35,9 +35,6 @@ async fn main(_spawner: Spawner) {
 
     let mut grinder = Output::new(p.PIN_0, Level::High);
 
-    info!("Hello, coffee world!");
-    info!("Grindy is ready - waiting for portafilter...");
-
     let dt = Input::new(p.PIN_17, Pull::Down);
     let sck = Output::new(p.PIN_16, Level::Low);
     let delay = Delay {};
@@ -69,6 +66,9 @@ async fn main(_spawner: Spawner) {
     const STABILIZATION_TIME: Duration = Duration::from_secs(2);
     // Tolerance for weight stability (grams).
     const WEIGHT_STABILITY_TOLERANCE: f32 = 0.5;
+
+    info!("Hello, coffee world!");
+    info!("Grindy is ready - waiting for portafilter...");
 
     loop {
         if scale.is_ready() {

@@ -409,7 +409,6 @@ dependencies = [
  "pio",
  "rand_core 0.6.4",
  "rand_core 0.9.3",
- "rp-binary-info",
  "rp-pac",
  "rp2040-boot2",
  "sha2-const-stable",
@@ -1061,12 +1060,6 @@ checksum = "0c6a884d2998352bb4daf0183589aec883f16a6da1f4dde84d8e2e9a5409a1ce"
 dependencies = [
  "bytemuck",
 ]
-
-[[package]]
-name = "rp-binary-info"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88ed2051a0bf2c726df01cfce378ed8a367be2a6e402fc183857f429a346d429"
 
 [[package]]
 name = "rp-pac"
