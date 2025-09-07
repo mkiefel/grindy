@@ -153,7 +153,14 @@ async fn main(spawner: Spawner) {
 
     loop {
         if scale.is_ready() {
-            let reading = scale.read_scaled().unwrap();
+            let reading = match scale.read_scaled() {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!("Failed to read scale although it was ready.");
+                    Timer::after(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
             buffer.write(reading);
 
             let avg_weight = (buffer.iter().sum::<f32>() / (buffer.len() as f32)).abs();
