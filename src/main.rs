@@ -10,7 +10,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{self, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, watch};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, mutex, watch};
 use embassy_time::{Delay, Duration, Instant, Timer};
 use gpio::{Input, Level, Output};
 use loadcell::{hx711::GainMode, LoadCell};
@@ -47,13 +47,29 @@ async fn net_task(mut stack: embassy_net::Runner<'static, cyw43::NetDriver<'stat
     stack.run().await
 }
 
-struct AppProps;
+struct AppProps {
+    grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
+}
 
 impl AppBuilder for AppProps {
     type PathRouter = impl picoserve::routing::PathRouter;
 
     fn build_app(self) -> picoserve::Router<Self::PathRouter> {
-        picoserve::Router::new().route("/", get(|| async move { "Hello World" }))
+        let Self {
+            grinder_state_machine,
+        } = self;
+        picoserve::Router::new().route(
+            "/",
+            get(move || async move {
+                let grinder_state_machine_guard = grinder_state_machine.lock().await;
+                match grinder_state_machine_guard.as_user_event() {
+                    UserEvent::Idle => "Status: Idle",
+                    UserEvent::Stabilizing => "Status: Stabilizing...",
+                    UserEvent::Grinding => "Status: Grinding...",
+                    UserEvent::WaitingForRemoval => "Status: Waiting for portafilter removal...",
+                }
+            }),
+        )
     }
 }
 
@@ -110,7 +126,7 @@ async fn scale_task(
             };
         }
         // Let other tasks run.
-        // TODO: Implement this with the proper predicate to wait for HX711 readiness.
+        // TODO: Implement this with async PIO to predict HX711 readiness.
         Timer::after(Duration::from_millis(10)).await;
     }
 }
@@ -177,8 +193,18 @@ fn bringup_network_stack(
     stack
 }
 
-fn bringup_web_server(spawner: &Spawner, stack: embassy_net::Stack<'static>) {
-    let app = make_static!(AppRouter<AppProps>, AppProps.build_app());
+fn bringup_web_server(
+    spawner: &Spawner,
+    stack: embassy_net::Stack<'static>,
+    grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
+) {
+    let app = make_static!(
+        AppRouter<AppProps>,
+        AppProps {
+            grinder_state_machine
+        }
+        .build_app()
+    );
     let config = make_static!(
         picoserve::Config::<Duration>,
         picoserve::Config::new(picoserve::Timeouts {
@@ -206,10 +232,12 @@ impl ScaleSetting {
     }
 }
 
+const MAX_GRIND_TIME_IN_SECS: usize = 50;
+
 struct GrinderStateMachine {
     grinder: Output<'static>,
     scale_setting: ScaleSetting,
-    state: GrinderState,
+    state: Option<GrinderState>,
 }
 
 enum GrinderState {
@@ -217,12 +245,12 @@ enum GrinderState {
         mean_offset: f32,
         sample_count: usize,
     },
-    WaitingForCalibration,
+    WaitingForCalibration {},
     Calibrating {
         mean_weight: f32,
         sample_count: usize,
     },
-    WaitingForPortafilter,
+    WaitingForPortafilter {},
     Stabilizing {
         start_time: Instant,
         portafilter_weight: f32,
@@ -232,18 +260,33 @@ enum GrinderState {
         start_time: Instant,
         portafilter_weight: f32,
     },
-    WaitingForRemoval,
+    WaitingForRemoval {},
 }
 
 impl GrinderStateMachine {
+    fn new(grinder: Output<'static>) -> Self {
+        Self {
+            grinder,
+            scale_setting: ScaleSetting {
+                offset: 0.0,
+                factor: 200.0 / 85314.55,
+            },
+            state: Some(GrinderState::Tare {
+                mean_offset: 0.0,
+                sample_count: 0,
+            }),
+        }
+    }
+
     fn as_user_event(&self) -> UserEvent {
-        match self.state {
-            GrinderState::Tare { .. } | GrinderState::WaitingForPortafilter => UserEvent::Idle,
-            GrinderState::WaitingForCalibration {} => UserEvent::Idle,
+        match self.state.as_ref().unwrap() {
+            GrinderState::Tare { .. }
+            | GrinderState::WaitingForPortafilter { .. }
+            | GrinderState::WaitingForCalibration {} => UserEvent::Idle,
             GrinderState::Calibrating { .. } => UserEvent::Stabilizing,
             GrinderState::Stabilizing { .. } => UserEvent::Stabilizing,
             GrinderState::Grinding { .. } => UserEvent::Grinding,
-            GrinderState::WaitingForRemoval {} => UserEvent::WaitingForRemoval,
+            GrinderState::WaitingForRemoval { .. } => UserEvent::WaitingForRemoval,
         }
     }
 
@@ -263,7 +306,7 @@ impl GrinderStateMachine {
 
         let weight = self.scale_setting.translate(raw_weight);
         debug!("weight: {}", weight);
-        self.state = match self.state {
+        self.state = Some(match self.state.take().unwrap() {
             GrinderState::Tare {
                 mean_offset,
                 sample_count,
@@ -284,7 +327,7 @@ impl GrinderStateMachine {
                 }
             }
 
-            GrinderState::WaitingForCalibration => {
+            GrinderState::WaitingForCalibration {} => {
                 if weight > CALIBRATION_WEIGHT * 0.8 {
                     info!(
                         "Known weight detected: {}g - starting calibration...",
@@ -295,7 +338,7 @@ impl GrinderStateMachine {
                         sample_count: 1,
                     }
                 } else {
-                    GrinderState::WaitingForCalibration
+                    GrinderState::WaitingForCalibration {}
                 }
             }
 
@@ -379,6 +422,7 @@ impl GrinderStateMachine {
                 portafilter_weight,
             } => {
                 let coffee_weight = weight - portafilter_weight;
+
                 info!(
                     "Grinding... Coffee: {}g (Total: {}g)",
                     (coffee_weight * 10.0).floor() / 10.0,
@@ -386,7 +430,8 @@ impl GrinderStateMachine {
                 );
 
                 if coffee_weight >= TARGET_COFFEE_WEIGHT
-                    || Instant::now() - start_time >= Duration::from_secs(50)
+                    || Instant::now() - start_time
+                        >= Duration::from_secs(MAX_GRIND_TIME_IN_SECS as u64)
                 {
                     info!(
                         "Target reached! {}g coffee ground - stopping grinder",
@@ -410,33 +455,25 @@ impl GrinderStateMachine {
                     GrinderState::WaitingForRemoval {}
                 }
             }
-        }
+        })
     }
 }
 
 async fn controller_task(
     scale_receiver: channel::Receiver<'static, CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE>,
     state_sender: watch::Sender<'static, CriticalSectionRawMutex, UserEvent, 1>,
-    grinder: Output<'static>,
+    grinder_state_machine: &mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
 ) {
-    let mut grinder_state_machine = GrinderStateMachine {
-        grinder,
-        scale_setting: ScaleSetting {
-            offset: 0.0,
-            factor: 200.0 / 85314.55,
-        },
-        state: GrinderState::Tare {
-            mean_offset: 0.0,
-            sample_count: 0,
-        },
-    };
-
-    state_sender.send(grinder_state_machine.as_user_event());
+    state_sender.send(grinder_state_machine.lock().await.as_user_event());
 
     loop {
         let raw_weight = scale_receiver.receive().await;
-        grinder_state_machine.update_weight(raw_weight);
-        state_sender.send(grinder_state_machine.as_user_event());
+        let event = {
+            let mut grinder_state_machine_guard = grinder_state_machine.lock().await;
+            grinder_state_machine_guard.update_weight(raw_weight);
+            grinder_state_machine_guard.as_user_event()
+        };
+        state_sender.send(event);
     }
 }
 
@@ -481,8 +518,19 @@ async fn main(spawner: Spawner) {
     static STATE_WATCH: watch::Watch<CriticalSectionRawMutex, UserEvent, 1> = watch::Watch::new();
     spawner.must_spawn(led_task(control, unwrap!(STATE_WATCH.receiver())));
 
-    bringup_web_server(&spawner, stack);
+    static GRINDER_STATE_MACHINE: StaticCell<
+        mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
+    > = StaticCell::new();
+    let grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine> =
+        GRINDER_STATE_MACHINE.init(mutex::Mutex::new(GrinderStateMachine::new(grinder)));
+
+    bringup_web_server(&spawner, stack, &grinder_state_machine);
 
     info!("Hello, coffee world!");
-    controller_task(SCALE_CHANNEL.receiver(), STATE_WATCH.sender(), grinder).await;
+    controller_task(
+        SCALE_CHANNEL.receiver(),
+        STATE_WATCH.sender(),
+        &grinder_state_machine,
+    )
+    .await;
 }

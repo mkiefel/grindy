@@ -16,7 +16,7 @@ cortex-m = { version = "~0.7", features = ["inline-asm"] }
 cortex-m-rt = "~0.7"
 panic-probe = { version = "~1.0", features = ["print-defmt"] }
 loadcell = "~0.3"
-heapless = "~0.8"
+heapless = { version = "~0.9", features = ["serde"] }
 num-traits = { version = "~0.2", default-features = false }
 embassy-sync = "~0.7"
 cyw43 = { version = "~0.5", features = ["defmt", "firmware-logs"] }
