@@ -10,7 +10,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{self, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, watch};
 use embassy_time::{Delay, Duration, Instant, Timer};
 use gpio::{Input, Level, Output};
 use loadcell::{hx711::GainMode, LoadCell};
@@ -84,38 +84,69 @@ async fn web_task(
     .await
 }
 
+const SCALE_CHANNEL_SIZE: usize = 5;
+
+#[embassy_executor::task]
+async fn scale_task(
+    sck: Output<'static>,
+    dt: Input<'static>,
+    sender: channel::Sender<'static, CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE>,
+) {
+    let delay = Delay {};
+    let mut scale = loadcell::hx711::HX711::new(sck, dt, delay);
+    scale.set_gain_mode(GainMode::A64);
+
+    loop {
+        if scale.is_ready() {
+            match scale.read() {
+                Ok(r) => {
+                    sender.send(r as f32).await;
+                }
+                Err(_) => {
+                    warn!("Failed to read scale although it was ready.");
+                    Timer::after(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+        }
+        // Let other tasks run.
+        // TODO: Implement this with the proper predicate to wait for HX711 readiness.
+        Timer::after(Duration::from_millis(10)).await;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum GrinderState {
-    WaitingForPortafilter,
+enum UserEvent {
+    Idle,
     Stabilizing,
     Grinding,
     WaitingForRemoval,
 }
 
-static STATE_WATCH: Watch<CriticalSectionRawMutex, GrinderState, 1> = Watch::new();
-
 #[embassy_executor::task]
-async fn led_task(mut control: Control<'static>) {
-    let mut state_receiver = unwrap!(STATE_WATCH.receiver());
+async fn led_task(
+    mut control: Control<'static>,
+    mut state_receiver: watch::Receiver<'static, CriticalSectionRawMutex, UserEvent, 1>,
+) {
     loop {
         match state_receiver.get().await {
-            GrinderState::WaitingForPortafilter => {
+            UserEvent::Idle => {
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(1000)).await;
                 control.gpio_set(0, false).await;
                 Timer::after(Duration::from_millis(1000)).await;
             }
-            GrinderState::Stabilizing => {
+            UserEvent::Stabilizing => {
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(250)).await;
                 control.gpio_set(0, false).await;
                 Timer::after(Duration::from_millis(250)).await;
             }
-            GrinderState::Grinding => {
+            UserEvent::Grinding => {
                 control.gpio_set(0, true).await;
                 state_receiver.changed().await;
             }
-            GrinderState::WaitingForRemoval => {
+            UserEvent::WaitingForRemoval => {
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
                 control.gpio_set(0, false).await;
@@ -164,6 +195,251 @@ fn bringup_web_server(spawner: &Spawner, stack: embassy_net::Stack<'static>) {
     }
 }
 
+struct ScaleSetting {
+    offset: f32,
+    factor: f32,
+}
+
+impl ScaleSetting {
+    fn translate(&self, raw: f32) -> f32 {
+        (raw - self.offset) * self.factor
+    }
+}
+
+struct GrinderStateMachine {
+    grinder: Output<'static>,
+    scale_setting: ScaleSetting,
+    state: GrinderState,
+}
+
+enum GrinderState {
+    Tare {
+        mean_offset: f32,
+        sample_count: usize,
+    },
+    WaitingForCalibration,
+    Calibrating {
+        mean_weight: f32,
+        sample_count: usize,
+    },
+    WaitingForPortafilter,
+    Stabilizing {
+        start_time: Instant,
+        portafilter_weight: f32,
+        sample_count: usize,
+    },
+    Grinding {
+        start_time: Instant,
+        portafilter_weight: f32,
+    },
+    WaitingForRemoval,
+}
+
+impl GrinderStateMachine {
+    fn as_user_event(&self) -> UserEvent {
+        match self.state {
+            GrinderState::Tare { .. } | GrinderState::WaitingForPortafilter => UserEvent::Idle,
+            GrinderState::WaitingForCalibration {} => UserEvent::Idle,
+            GrinderState::Calibrating { .. } => UserEvent::Stabilizing,
+            GrinderState::Stabilizing { .. } => UserEvent::Stabilizing,
+            GrinderState::Grinding { .. } => UserEvent::Grinding,
+            GrinderState::WaitingForRemoval {} => UserEvent::WaitingForRemoval,
+        }
+    }
+
+    fn update_weight(&mut self, raw_weight: f32) {
+        // Minimum weight to detect portafilter placement.
+        const CALIBRATION_WEIGHT: f32 = 200.0;
+        // Minimum weight to detect portafilter placement.
+        const PORTAFILTER_THRESHOLD: f32 = 100.0;
+        // Weight below which we consider portafilter removed.
+        const REMOVAL_THRESHOLD: f32 = 10.0;
+        // Target coffee weight in grams.
+        const TARGET_COFFEE_WEIGHT: f32 = 18.0;
+        // Time to wait for weight stabilization.
+        const STABILIZATION_TIME: Duration = Duration::from_secs(2);
+        // Tolerance for weight stability (grams).
+        const WEIGHT_STABILITY_TOLERANCE: f32 = 1.0;
+
+        let weight = self.scale_setting.translate(raw_weight);
+        debug!("weight: {}", weight);
+        self.state = match self.state {
+            GrinderState::Tare {
+                mean_offset,
+                sample_count,
+            } => {
+                // TODO(mkiefel): Estimate variance here as well to use it later for the estimation
+                // of weights.
+                let new_mean_offset = (mean_offset * (sample_count as f32) + raw_weight)
+                    / (sample_count as f32 + 1.0);
+                if sample_count >= 30 {
+                    info!("Tare complete. Offset: {}", new_mean_offset);
+                    self.scale_setting.offset = new_mean_offset;
+                    GrinderState::WaitingForCalibration {}
+                } else {
+                    GrinderState::Tare {
+                        mean_offset: new_mean_offset,
+                        sample_count: sample_count + 1,
+                    }
+                }
+            }
+
+            GrinderState::WaitingForCalibration => {
+                if weight > CALIBRATION_WEIGHT * 0.8 {
+                    info!(
+                        "Known weight detected: {}g - starting calibration...",
+                        weight
+                    );
+                    GrinderState::Calibrating {
+                        mean_weight: weight,
+                        sample_count: 1,
+                    }
+                } else {
+                    GrinderState::WaitingForCalibration
+                }
+            }
+
+            GrinderState::Calibrating {
+                mean_weight,
+                sample_count,
+            } => {
+                let new_mean_weight =
+                    (mean_weight * (sample_count as f32) + weight) / (sample_count as f32 + 1.0);
+                if sample_count >= 200 {
+                    let factor = CALIBRATION_WEIGHT / new_mean_weight;
+                    info!(
+                        "Calibration complete. Offset: {}g, Factor: {}",
+                        new_mean_weight, factor
+                    );
+                    self.scale_setting.factor *= factor;
+                    GrinderState::WaitingForRemoval {}
+                } else {
+                    GrinderState::Calibrating {
+                        mean_weight: new_mean_weight,
+                        sample_count: sample_count + 1,
+                    }
+                }
+            }
+
+            GrinderState::WaitingForPortafilter {} => {
+                if weight > PORTAFILTER_THRESHOLD {
+                    info!("Portafilter detected! Weight: {}g - stabilizing...", weight);
+
+                    GrinderState::Stabilizing {
+                        start_time: Instant::now(),
+                        portafilter_weight: weight,
+                        sample_count: 1,
+                    }
+                } else {
+                    GrinderState::WaitingForPortafilter {}
+                }
+            }
+
+            GrinderState::Stabilizing {
+                start_time,
+                portafilter_weight,
+                sample_count,
+            } => {
+                // Check if weight is stable (within tolerance of initial portafilter weight).
+                let weight_diff = (weight - portafilter_weight).abs();
+
+                if weight < PORTAFILTER_THRESHOLD {
+                    // Portafilter removed during stabilization
+                    info!("Portafilter removed during stabilization - waiting for placement");
+                    GrinderState::WaitingForPortafilter {}
+                } else if weight_diff > WEIGHT_STABILITY_TOLERANCE {
+                    // TODO(mkiefel): Make this dependent on sample count.
+                    // Weight changed significantly, restart stabilization.
+                    GrinderState::Stabilizing {
+                        start_time: Instant::now(),
+                        portafilter_weight: weight,
+                        sample_count: 1,
+                    }
+                } else if Instant::now() - start_time >= STABILIZATION_TIME {
+                    // TODO(mkiefel): Make this dependent on sample count.
+                    info!("Weight stabilized at {}g - starting grind!", weight);
+                    self.grinder.set_low();
+                    GrinderState::Grinding {
+                        start_time: Instant::now(),
+                        portafilter_weight,
+                    }
+                } else {
+                    GrinderState::Stabilizing {
+                        start_time,
+                        portafilter_weight: (sample_count as f32) / (sample_count as f32 + 1.0)
+                            * portafilter_weight
+                            + weight / (sample_count as f32 + 1.0),
+                        sample_count: sample_count + 1,
+                    }
+                }
+            }
+
+            GrinderState::Grinding {
+                start_time,
+                portafilter_weight,
+            } => {
+                let coffee_weight = weight - portafilter_weight;
+                info!(
+                    "Grinding... Coffee: {}g (Total: {}g)",
+                    (coffee_weight * 10.0).floor() / 10.0,
+                    weight
+                );
+
+                if coffee_weight >= TARGET_COFFEE_WEIGHT
+                    || Instant::now() - start_time >= Duration::from_secs(50)
+                {
+                    info!(
+                        "Target reached! {}g coffee ground - stopping grinder",
+                        (coffee_weight * 10.0).floor() / 10.0
+                    );
+                    self.grinder.set_high();
+                    GrinderState::WaitingForRemoval {}
+                } else {
+                    GrinderState::Grinding {
+                        start_time,
+                        portafilter_weight,
+                    }
+                }
+            }
+
+            GrinderState::WaitingForRemoval {} => {
+                if weight < REMOVAL_THRESHOLD {
+                    info!("Portafilter removed - ready for next cycle");
+                    GrinderState::WaitingForPortafilter {}
+                } else {
+                    GrinderState::WaitingForRemoval {}
+                }
+            }
+        }
+    }
+}
+
+async fn controller_task(
+    scale_receiver: channel::Receiver<'static, CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE>,
+    state_sender: watch::Sender<'static, CriticalSectionRawMutex, UserEvent, 1>,
+    grinder: Output<'static>,
+) {
+    let mut grinder_state_machine = GrinderStateMachine {
+        grinder,
+        scale_setting: ScaleSetting {
+            offset: 0.0,
+            factor: 200.0 / 85314.55,
+        },
+        state: GrinderState::Tare {
+            mean_offset: 0.0,
+            sample_count: 0,
+        },
+    };
+
+    state_sender.send(grinder_state_machine.as_user_event());
+
+    loop {
+        let raw_weight = scale_receiver.receive().await;
+        grinder_state_machine.update_weight(raw_weight);
+        state_sender.send(grinder_state_machine.as_user_event());
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -193,149 +469,20 @@ async fn main(spawner: Spawner) {
     let stack = bringup_network_stack(&spawner, net_device);
     control.start_ap_wpa2("grindy", "grindyrockz", 8).await;
 
-    let mut grinder = Output::new(p.PIN_0, Level::High);
+    let grinder = Output::new(p.PIN_0, Level::High);
 
     let dt = Input::new(p.PIN_17, Pull::Down);
     let sck = Output::new(p.PIN_16, Level::Low);
-    let delay = Delay {};
 
-    let mut scale = loadcell::hx711::HX711::new(sck, dt, delay);
-    scale.set_gain_mode(GainMode::A64);
+    static SCALE_CHANNEL: channel::Channel<CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE> =
+        channel::Channel::new();
+    spawner.must_spawn(scale_task(sck, dt, SCALE_CHANNEL.sender()));
 
-    // The initial tare seems to be a bit off. Just throw it away.
-    scale.tare(10);
-    scale.tare(20);
-    // scale.set_scale(1.0);
-    // Get some reference weight and adjust the scale, with something like <reference_weight> /
-    // <values that you get with scaling 1>. E.g.,
-    scale.set_scale(403.0 / 180919.2);
-
-    let mut buffer = heapless::HistoryBuffer::<_, 2>::new();
-    let mut state = GrinderState::WaitingForPortafilter;
-    let mut stabilization_start: Option<Instant> = None;
-    let mut grind_start: Option<Instant> = None;
-    let mut portafilter_weight = 0.0f32;
-
-    // Minimum weight to detect portafilter placement.
-    const PORTAFILTER_THRESHOLD: f32 = 100.0;
-    // Weight below which we consider portafilter removed.
-    const REMOVAL_THRESHOLD: f32 = 10.0;
-    // Target coffee weight in grams.
-    const TARGET_COFFEE_WEIGHT: f32 = 18.0;
-    // Time to wait for weight stabilization.
-    const STABILIZATION_TIME: Duration = Duration::from_secs(2);
-    // Tolerance for weight stability (grams).
-    const WEIGHT_STABILITY_TOLERANCE: f32 = 1.0;
-
-    spawner.must_spawn(led_task(control));
-    let state_sender = STATE_WATCH.sender();
-    state_sender.send(state);
+    static STATE_WATCH: watch::Watch<CriticalSectionRawMutex, UserEvent, 1> = watch::Watch::new();
+    spawner.must_spawn(led_task(control, unwrap!(STATE_WATCH.receiver())));
 
     bringup_web_server(&spawner, stack);
 
     info!("Hello, coffee world!");
-    info!("Grindy is ready - waiting for portafilter...");
-
-    loop {
-        if scale.is_ready() {
-            let reading = match scale.read_scaled() {
-                Ok(r) => r,
-                Err(_) => {
-                    warn!("Failed to read scale although it was ready.");
-                    Timer::after(Duration::from_millis(50)).await;
-                    continue;
-                }
-            };
-            buffer.write(reading);
-
-            let avg_weight = (buffer.iter().sum::<f32>() / (buffer.len() as f32)).abs();
-            let rounded_weight = (avg_weight * 10.0).floor() / 10.0;
-
-            debug!("Weight: {}g", rounded_weight);
-
-            match state {
-                GrinderState::WaitingForPortafilter => {
-                    if avg_weight > PORTAFILTER_THRESHOLD {
-                        info!(
-                            "Portafilter detected! Weight: {}g - stabilizing...",
-                            rounded_weight
-                        );
-                        state = GrinderState::Stabilizing;
-                        state_sender.send(state);
-                        stabilization_start = Some(Instant::now());
-                        portafilter_weight = avg_weight;
-                    }
-                }
-
-                GrinderState::Stabilizing => {
-                    // Check if weight is stable (within tolerance of initial portafilter weight).
-                    let weight_diff = (avg_weight - portafilter_weight).abs();
-
-                    if avg_weight < PORTAFILTER_THRESHOLD {
-                        // Portafilter removed during stabilization
-                        info!("Portafilter removed during stabilization - waiting for placement");
-                        state = GrinderState::WaitingForPortafilter;
-                        state_sender.send(state);
-                        stabilization_start = None;
-                        portafilter_weight = 0.0;
-                    } else if weight_diff > WEIGHT_STABILITY_TOLERANCE {
-                        // Weight changed significantly, restart stabilization.
-                        stabilization_start = Some(Instant::now());
-                        portafilter_weight = avg_weight;
-                        info!(
-                            "Weight changing, restarting stabilization: {}g",
-                            rounded_weight
-                        );
-                    } else if let Some(start_time) = stabilization_start {
-                        if Instant::now() - start_time >= STABILIZATION_TIME {
-                            info!("Weight stabilized at {}g - starting grind!", rounded_weight);
-                            state = GrinderState::Grinding;
-                            state_sender.send(state);
-                            grinder.set_low();
-                            grind_start = Some(Instant::now());
-                        }
-                    }
-                }
-
-                GrinderState::Grinding => {
-                    let coffee_weight = avg_weight - portafilter_weight;
-                    info!(
-                        "Grinding... Coffee: {}g (Total: {}g)",
-                        (coffee_weight * 10.0).floor() / 10.0,
-                        rounded_weight
-                    );
-
-                    if coffee_weight >= TARGET_COFFEE_WEIGHT
-                        || grind_start
-                            .map_or(false, |t| Instant::now() - t >= Duration::from_secs(50))
-                    {
-                        info!(
-                            "Target reached! {}g coffee ground - stopping grinder",
-                            (coffee_weight * 10.0).floor() / 10.0
-                        );
-                        grinder.set_high();
-                        grind_start = None;
-                        state = GrinderState::WaitingForRemoval;
-                        state_sender.send(state);
-                        info!(
-                            "Waiting for portafilter removal... Current weight: {}g",
-                            rounded_weight
-                        );
-                    }
-                }
-
-                GrinderState::WaitingForRemoval => {
-                    if avg_weight < REMOVAL_THRESHOLD {
-                        info!("Portafilter removed - ready for next cycle");
-                        state = GrinderState::WaitingForPortafilter;
-                        state_sender.send(state);
-                        stabilization_start = None;
-                        portafilter_weight = 0.0;
-                    }
-                }
-            }
-        }
-        // Let other tasks run.
-        Timer::after(Duration::from_millis(50)).await;
-    }
+    controller_task(SCALE_CHANNEL.receiver(), STATE_WATCH.sender(), grinder).await;
 }
