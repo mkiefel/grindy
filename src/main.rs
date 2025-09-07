@@ -208,7 +208,8 @@ async fn main(spawner: Spawner) {
     // scale.set_scale(1.0);
     // Get some reference weight and adjust the scale, with something like <reference_weight> /
     // <values that you get with scaling 1>. E.g.,
-    scale.set_scale(403.0 / 180919.2);
+    // scale.set_scale(403.0 / 180919.2);
+    scale.set_scale(200.0 / 85314.55);
 
     let mut buffer = heapless::HistoryBuffer::<_, 2>::new();
     let mut state = GrinderState::WaitingForPortafilter;
@@ -226,6 +227,8 @@ async fn main(spawner: Spawner) {
     const STABILIZATION_TIME: Duration = Duration::from_secs(2);
     // Tolerance for weight stability (grams).
     const WEIGHT_STABILITY_TOLERANCE: f32 = 1.0;
+    // How often the scale updates (Hz).
+    const SCALE_UPDATE_RATE: f32 = 80.0;
 
     spawner.must_spawn(led_task(control));
     let state_sender = STATE_WATCH.sender();
@@ -235,6 +238,21 @@ async fn main(spawner: Spawner) {
 
     info!("Hello, coffee world!");
     info!("Grindy is ready - waiting for portafilter...");
+
+    // let mut buffer_ = heapless::HistoryBuffer::<_, 20>::new();
+    // loop {
+    //     if scale.is_ready() {
+    //         let reading = scale.read_scaled().unwrap();
+    //         buffer_.write(reading);
+    //         let avg_weight = (buffer_.iter().sum::<f32>() / (buffer_.len() as f32)).abs();
+    //         // let rounded = (reading * 100.0).floor() as i64;
+    //         let mut data = String::<128>::new();
+    //         write!(data, "Weight {reading} {avg_weight}\r\n").unwrap();
+    //         class.write_packet(data.as_bytes()).await.unwrap();
+    //     }
+    //     // Let other tasks run.
+    //     Timer::after(Duration::from_millis(500)).await;
+    // }
 
     loop {
         if scale.is_ready() {
