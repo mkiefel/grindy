@@ -11,6 +11,17 @@ use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
 use {defmt_rtt as _, panic_probe as _};
 
+#[unsafe(link_section = ".bi_entries")]
+#[used]
+pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
+    embassy_rp::binary_info::rp_program_name!(c"Grindy - Coffee Grinder Controller"),
+    embassy_rp::binary_info::rp_program_description!(
+        c"An automated coffee grinder controller using a Raspberry Pi Pico"
+    ),
+    embassy_rp::binary_info::rp_cargo_version!(),
+    embassy_rp::binary_info::rp_program_build_attribute!(),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum GrinderState {
     WaitingForPortafilter,
@@ -53,7 +64,7 @@ async fn led_task(mut led: Output<'static>) {
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut grinder = Output::new(p.PIN_0, Level::High);
@@ -92,7 +103,7 @@ async fn main(_spawner: Spawner) {
     // Tolerance for weight stability (grams).
     const WEIGHT_STABILITY_TOLERANCE: f32 = 0.5;
 
-    _spawner.spawn(led_task(led)).unwrap();
+    spawner.spawn(led_task(led)).unwrap();
     let state_sender = STATE_WATCH.sender();
     state_sender.send(state);
 
