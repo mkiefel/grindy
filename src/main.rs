@@ -101,7 +101,7 @@ async fn main(spawner: Spawner) {
     // Time to wait for weight stabilization.
     const STABILIZATION_TIME: Duration = Duration::from_secs(2);
     // Tolerance for weight stability (grams).
-    const WEIGHT_STABILITY_TOLERANCE: f32 = 0.5;
+    const WEIGHT_STABILITY_TOLERANCE: f32 = 1.0;
 
     spawner.spawn(led_task(led)).unwrap();
     let state_sender = STATE_WATCH.sender();
