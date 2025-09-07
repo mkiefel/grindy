@@ -1,7 +1,8 @@
 #![no_std]
 #![no_main]
+#![feature(impl_trait_in_assoc_type)]
 
-use cyw43::Control;
+use cyw43::{Control, NetDriver};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
@@ -14,6 +15,8 @@ use embassy_time::{Delay, Duration, Instant, Timer};
 use gpio::{Input, Level, Output};
 use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
+use picoserve::routing::get;
+use picoserve::{make_static, AppBuilder, AppRouter};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -37,6 +40,48 @@ async fn cyw43_task(
     runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
 ) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn net_task(mut stack: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
+    stack.run().await
+}
+
+struct AppProps;
+
+impl AppBuilder for AppProps {
+    type PathRouter = impl picoserve::routing::PathRouter;
+
+    fn build_app(self) -> picoserve::Router<Self::PathRouter> {
+        picoserve::Router::new().route("/", get(|| async move { "Hello World" }))
+    }
+}
+
+const WEB_TASK_POOL_SIZE: usize = 8;
+
+#[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
+async fn web_task(
+    task_id: usize,
+    stack: embassy_net::Stack<'static>,
+    app: &'static AppRouter<AppProps>,
+    config: &'static picoserve::Config<Duration>,
+) -> ! {
+    let port = 80;
+    let mut tcp_rx_buffer = [0; 1024];
+    let mut tcp_tx_buffer = [0; 1024];
+    let mut http_buffer = [0; 2048];
+
+    picoserve::listen_and_serve(
+        task_id,
+        app,
+        config,
+        stack,
+        port,
+        &mut tcp_rx_buffer,
+        &mut tcp_tx_buffer,
+        &mut http_buffer,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -80,6 +125,45 @@ async fn led_task(mut control: Control<'static>) {
     }
 }
 
+fn bringup_network_stack(
+    spawner: &Spawner,
+    net_device: NetDriver<'static>,
+) -> embassy_net::Stack<'static> {
+    let (stack, runner) = embassy_net::new(
+        net_device,
+        embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
+            address: embassy_net::Ipv4Cidr::new(core::net::Ipv4Addr::new(192, 168, 22, 1), 24),
+            gateway: None,
+            dns_servers: Default::default(),
+        }),
+        make_static!(
+            embassy_net::StackResources::<WEB_TASK_POOL_SIZE>,
+            embassy_net::StackResources::new()
+        ),
+        embassy_rp::clocks::RoscRng.next_u64(),
+    );
+    spawner.must_spawn(net_task(runner));
+    stack
+}
+
+fn bringup_web_server(spawner: &Spawner, stack: embassy_net::Stack<'static>) {
+    let app = make_static!(AppRouter<AppProps>, AppProps.build_app());
+    let config = make_static!(
+        picoserve::Config::<Duration>,
+        picoserve::Config::new(picoserve::Timeouts {
+            start_read_request: Some(Duration::from_secs(5)),
+            persistent_start_read_request: Some(Duration::from_secs(1)),
+            read_request: Some(Duration::from_secs(1)),
+            write: Some(Duration::from_secs(1)),
+        })
+        .keep_connection_alive()
+    );
+
+    for task_id in 0..WEB_TASK_POOL_SIZE {
+        spawner.must_spawn(web_task(task_id, stack, app, config));
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -102,13 +186,12 @@ async fn main(spawner: Spawner) {
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-    unwrap!(spawner.spawn(cyw43_task(runner)));
-
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+    spawner.must_spawn(cyw43_task(runner));
     control.init(clm).await;
-    control
-        .set_power_management(cyw43::PowerManagementMode::PowerSave)
-        .await;
+
+    let stack = bringup_network_stack(&spawner, net_device);
+    control.start_ap_wpa2("grindy", "grindyrockz", 8).await;
 
     let mut grinder = Output::new(p.PIN_0, Level::High);
 
@@ -144,9 +227,11 @@ async fn main(spawner: Spawner) {
     // Tolerance for weight stability (grams).
     const WEIGHT_STABILITY_TOLERANCE: f32 = 1.0;
 
-    unwrap!(spawner.spawn(led_task(control)));
+    spawner.must_spawn(led_task(control));
     let state_sender = STATE_WATCH.sender();
     state_sender.send(state);
+
+    bringup_web_server(&spawner, stack);
 
     info!("Hello, coffee world!");
     info!("Grindy is ready - waiting for portafilter...");
