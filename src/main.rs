@@ -1,14 +1,20 @@
 #![no_std]
 #![no_main]
 
+use cyw43::Control;
+use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{self, Pull};
+use embassy_rp::peripherals::{DMA_CH0, PIO0};
+use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
 use embassy_time::{Delay, Duration, Instant, Timer};
 use gpio::{Input, Level, Output};
 use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 #[unsafe(link_section = ".bi_entries")]
@@ -22,6 +28,17 @@ pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
     embassy_rp::binary_info::rp_program_build_attribute!(),
 ];
 
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+});
+
+#[embassy_executor::task]
+async fn cyw43_task(
+    runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
+) -> ! {
+    runner.run().await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum GrinderState {
     WaitingForPortafilter,
@@ -33,30 +50,30 @@ enum GrinderState {
 static STATE_WATCH: Watch<CriticalSectionRawMutex, GrinderState, 1> = Watch::new();
 
 #[embassy_executor::task]
-async fn led_task(mut led: Output<'static>) {
-    let mut state_receiver = STATE_WATCH.receiver().unwrap();
+async fn led_task(mut control: Control<'static>) {
+    let mut state_receiver = unwrap!(STATE_WATCH.receiver());
     loop {
         match state_receiver.get().await {
             GrinderState::WaitingForPortafilter => {
-                led.set_high();
+                control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(1000)).await;
-                led.set_low();
+                control.gpio_set(0, false).await;
                 Timer::after(Duration::from_millis(1000)).await;
             }
             GrinderState::Stabilizing => {
-                led.set_high();
+                control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(250)).await;
-                led.set_low();
+                control.gpio_set(0, false).await;
                 Timer::after(Duration::from_millis(250)).await;
             }
             GrinderState::Grinding => {
-                led.set_high();
+                control.gpio_set(0, true).await;
                 state_receiver.changed().await;
             }
             GrinderState::WaitingForRemoval => {
-                led.set_high();
+                control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
-                led.set_low();
+                control.gpio_set(0, false).await;
                 Timer::after(Duration::from_millis(100)).await;
             }
         }
@@ -66,10 +83,34 @@ async fn led_task(mut led: Output<'static>) {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
+    let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let mut pio = Pio::new(p.PIO0, Irqs);
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        RM2_CLOCK_DIVIDER,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        p.DMA_CH0,
+    );
+
+    static STATE: StaticCell<cyw43::State> = StaticCell::new();
+    let state = STATE.init(cyw43::State::new());
+    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+    unwrap!(spawner.spawn(cyw43_task(runner)));
+
+    control.init(clm).await;
+    control
+        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .await;
 
     let mut grinder = Output::new(p.PIN_0, Level::High);
-
-    let led = Output::new(p.PIN_25, Level::Low);
 
     let dt = Input::new(p.PIN_17, Pull::Down);
     let sck = Output::new(p.PIN_16, Level::Low);
@@ -103,7 +144,7 @@ async fn main(spawner: Spawner) {
     // Tolerance for weight stability (grams).
     const WEIGHT_STABILITY_TOLERANCE: f32 = 1.0;
 
-    spawner.spawn(led_task(led)).unwrap();
+    unwrap!(spawner.spawn(led_task(control)));
     let state_sender = STATE_WATCH.sender();
     state_sender.send(state);
 
