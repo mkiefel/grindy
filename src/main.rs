@@ -10,13 +10,16 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{self, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, mutex, watch};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, mutex, signal, watch};
 use embassy_time::{Delay, Duration, Instant, Timer};
 use gpio::{Input, Level, Output};
 use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
-use picoserve::routing::get;
+use picoserve::extract::Json;
+use picoserve::response::ws;
+use picoserve::routing::{get, get_service};
 use picoserve::{make_static, AppBuilder, AppRouter};
+use serde::Serialize;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -47,8 +50,176 @@ async fn net_task(mut stack: embassy_net::Runner<'static, cyw43::NetDriver<'stat
     stack.run().await
 }
 
+#[derive(Serialize)]
+struct StatusResponse {
+    status: UserEvent,
+}
+
+// WebSocket message types
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum WsMessage {
+    #[serde(rename_all = "camelCase")]
+    Connected { state: UserEvent, timestamp_ms: u64 },
+    #[serde(rename_all = "camelCase")]
+    StateChange { state: UserEvent, timestamp_ms: u64 },
+    #[serde(rename_all = "camelCase")]
+    WeightBatch {
+        readings: heapless::Vec<WeightReading, 4>,
+    },
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct WeightReading {
+    timestamp_ms: u64,
+    weight: f32,
+    state: UserEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coffee_weight: Option<f32>,
+}
+
+// WebSocket connection registry
+const MAX_WS_CONNECTIONS: usize = 4;
+
+struct WsConnectionRegistry {
+    connections:
+        [Option<&'static signal::Signal<CriticalSectionRawMutex, WsMessage>>; MAX_WS_CONNECTIONS],
+}
+
+impl WsConnectionRegistry {
+    const fn new() -> Self {
+        Self {
+            connections: [None; MAX_WS_CONNECTIONS],
+        }
+    }
+
+    fn register(
+        &mut self,
+        signal: &'static signal::Signal<CriticalSectionRawMutex, WsMessage>,
+    ) -> Option<usize> {
+        for (idx, slot) in self.connections.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(signal);
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn unregister(&mut self, idx: usize) {
+        if idx < MAX_WS_CONNECTIONS {
+            self.connections[idx] = None;
+        }
+    }
+
+    fn broadcast(&self, msg: &WsMessage) {
+        for slot in self.connections.iter() {
+            if let Some(signal) = slot {
+                signal.signal(msg.clone());
+            }
+        }
+    }
+}
+
+// WebSocket handler
+struct GrinderWebSocket {
+    registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
+    grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
+    signal: &'static signal::Signal<CriticalSectionRawMutex, WsMessage>,
+}
+
+impl ws::WebSocketCallback for GrinderWebSocket {
+    async fn run<R: picoserve::io::Read, W: picoserve::io::Write<Error = R::Error>>(
+        self,
+        mut rx: ws::SocketRx<R>,
+        mut tx: ws::SocketTx<W>,
+    ) -> Result<(), W::Error> {
+        // Register connection
+        let conn_id = {
+            let mut registry = self.registry.lock().await;
+            registry.register(self.signal)
+        };
+
+        let conn_id = match conn_id {
+            Some(id) => id,
+            None => {
+                warn!("WebSocket connection limit reached");
+                let _ = tx.close(None).await;
+                return Ok(());
+            }
+        };
+
+        info!("WebSocket client {} connected", conn_id);
+
+        // Send initial connected message with current state
+        let current_state = self.grinder_state_machine.lock().await.as_user_event();
+        let connected_msg = WsMessage::Connected {
+            state: current_state,
+            timestamp_ms: Instant::now().as_millis(),
+        };
+
+        if let Ok(json) = serde_json_core::to_string::<_, 256>(&connected_msg) {
+            let _ = tx.send_text(&json).await;
+        }
+
+        // Main loop: handle both broadcast messages and client messages
+        let mut buffer = [0u8; 128];
+        loop {
+            // Check for broadcast message or client message.
+            let input =
+                embassy_futures::select::select(self.signal.wait(), rx.next_message(&mut buffer))
+                    .await;
+
+            match input {
+                embassy_futures::select::Either::First(msg) => {
+                    if let Ok(json) = serde_json_core::to_string::<_, 512>(&msg) {
+                        if tx.send_text(&json).await.is_err() {
+                            // Client disconnected.
+                            break;
+                        }
+                    } else {
+                        warn!(
+                            "Failed to serialize WebSocket message for client {}",
+                            conn_id
+                        );
+                    }
+                }
+                embassy_futures::select::Either::Second(result) => match result {
+                    Ok(msg) => match msg {
+                        ws::Message::Close(_) => {
+                            info!("WebSocket client {} closed connection", conn_id);
+                            break;
+                        }
+                        ws::Message::Ping(data) => {
+                            if tx.send_pong(data).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => {} // Ignore other messages
+                    },
+                    Err(_) => {
+                        warn!("WebSocket client {} read error", conn_id);
+                        break;
+                    }
+                },
+            }
+        }
+
+        // Unregister connection on disconnect
+        {
+            let mut registry = self.registry.lock().await;
+            registry.unregister(conn_id);
+            info!("WebSocket client {} disconnected and unregistered", conn_id);
+        }
+
+        Ok(())
+    }
+}
+
 struct AppProps {
     grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
+    ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
 }
 
 impl AppBuilder for AppProps {
@@ -57,19 +228,62 @@ impl AppBuilder for AppProps {
     fn build_app(self) -> picoserve::Router<Self::PathRouter> {
         let Self {
             grinder_state_machine,
+            ws_registry,
         } = self;
-        picoserve::Router::new().route(
-            "/",
-            get(move || async move {
-                let grinder_state_machine_guard = grinder_state_machine.lock().await;
-                match grinder_state_machine_guard.as_user_event() {
-                    UserEvent::Idle => "Status: Idle",
-                    UserEvent::Stabilizing => "Status: Stabilizing...",
-                    UserEvent::Grinding => "Status: Grinding...",
-                    UserEvent::WaitingForRemoval => "Status: Waiting for portafilter removal...",
-                }
-            }),
-        )
+        picoserve::Router::new()
+            .route(
+                "/",
+                get_service(picoserve::response::File::html(include_str!("index.html"))),
+            )
+            .route(
+                "/index.js",
+                get_service(picoserve::response::File::javascript(include_str!(
+                    "index.js"
+                ))),
+            )
+            .route(
+                "/api/status",
+                get(move || async move {
+                    let grinder_state_machine_guard = grinder_state_machine.lock().await;
+                    let user_event = grinder_state_machine_guard.as_user_event();
+                    Json(StatusResponse { status: user_event })
+                }),
+            )
+            .route(
+                "/ws",
+                get(
+                    move |upgrade: picoserve::response::WebSocketUpgrade| async move {
+                        // Allocate a new signal for this connection
+                        // Note: This is a simplified version - in production we'd need a pool
+                        static WS_SIGNALS: [signal::Signal<CriticalSectionRawMutex, WsMessage>;
+                            MAX_WS_CONNECTIONS] = [
+                            signal::Signal::new(),
+                            signal::Signal::new(),
+                            signal::Signal::new(),
+                            signal::Signal::new(),
+                        ];
+
+                        // Find an available signal
+                        let signal_idx = {
+                            let registry = ws_registry.lock().await;
+                            let mut idx = 0;
+                            for (i, conn) in registry.connections.iter().enumerate() {
+                                if conn.is_none() {
+                                    idx = i;
+                                    break;
+                                }
+                            }
+                            idx
+                        };
+
+                        upgrade.on_upgrade(GrinderWebSocket {
+                            registry: ws_registry,
+                            grinder_state_machine,
+                            signal: &WS_SIGNALS[signal_idx],
+                        })
+                    },
+                ),
+            )
     }
 }
 
@@ -108,6 +322,7 @@ async fn scale_task(
     dt: Input<'static>,
     sender: channel::Sender<'static, CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE>,
 ) {
+    debug!("Setting up scale...");
     let delay = Delay {};
     let mut scale = loadcell::hx711::HX711::new(sck, dt, delay);
     scale.set_gain_mode(GainMode::A64);
@@ -131,7 +346,7 @@ async fn scale_task(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 enum UserEvent {
     Idle,
     Stabilizing,
@@ -142,7 +357,7 @@ enum UserEvent {
 #[embassy_executor::task]
 async fn led_task(
     mut control: Control<'static>,
-    mut state_receiver: watch::Receiver<'static, CriticalSectionRawMutex, UserEvent, 1>,
+    mut state_receiver: watch::Receiver<'static, CriticalSectionRawMutex, UserEvent, 2>,
 ) {
     loop {
         match state_receiver.get().await {
@@ -197,11 +412,13 @@ fn bringup_web_server(
     spawner: &Spawner,
     stack: embassy_net::Stack<'static>,
     grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
+    ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
 ) {
     let app = make_static!(
         AppRouter<AppProps>,
         AppProps {
-            grinder_state_machine
+            grinder_state_machine,
+            ws_registry,
         }
         .build_app()
     );
@@ -287,6 +504,15 @@ impl GrinderStateMachine {
             GrinderState::Stabilizing { .. } => UserEvent::Stabilizing,
             GrinderState::Grinding { .. } => UserEvent::Grinding,
             GrinderState::WaitingForRemoval { .. } => UserEvent::WaitingForRemoval,
+        }
+    }
+
+    fn get_coffee_weight(&self, current_weight: f32) -> Option<f32> {
+        match self.state.as_ref().unwrap() {
+            GrinderState::Grinding {
+                portafilter_weight, ..
+            } => Some(current_weight - portafilter_weight),
+            _ => None,
         }
     }
 
@@ -459,21 +685,105 @@ impl GrinderStateMachine {
     }
 }
 
+const WEIGHT_BATCH_CHANNEL_SIZE: usize = 2;
+
+#[embassy_executor::task]
+async fn websocket_broadcaster_task(
+    mut state_receiver: watch::Receiver<'static, CriticalSectionRawMutex, UserEvent, 2>,
+    weight_batch_receiver: channel::Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        heapless::Vec<WeightReading, 4>,
+        WEIGHT_BATCH_CHANNEL_SIZE,
+    >,
+    ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
+) {
+    let mut state_initial = state_receiver.get().await;
+    loop {
+        embassy_futures::select::select(
+            // Listen for state changes
+            async {
+                let new_state = state_receiver
+                    .changed_and(|&state| state != state_initial)
+                    .await;
+                let msg = WsMessage::StateChange {
+                    state: new_state,
+                    timestamp_ms: Instant::now().as_millis(),
+                };
+                let registry = ws_registry.lock().await;
+                registry.broadcast(&msg);
+                state_initial = new_state;
+            },
+            // Listen for weight batches
+            async {
+                let batch = weight_batch_receiver.receive().await;
+                if !batch.is_empty() {
+                    let msg = WsMessage::WeightBatch { readings: batch };
+                    let registry = ws_registry.lock().await;
+                    registry.broadcast(&msg);
+                }
+            },
+        )
+        .await;
+    }
+}
+
 async fn controller_task(
     scale_receiver: channel::Receiver<'static, CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE>,
-    state_sender: watch::Sender<'static, CriticalSectionRawMutex, UserEvent, 1>,
+    state_sender: watch::Sender<'static, CriticalSectionRawMutex, UserEvent, 2>,
+    weight_batch_sender: channel::Sender<
+        'static,
+        CriticalSectionRawMutex,
+        heapless::Vec<WeightReading, 4>,
+        WEIGHT_BATCH_CHANNEL_SIZE,
+    >,
     grinder_state_machine: &mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
 ) {
-    state_sender.send(grinder_state_machine.lock().await.as_user_event());
+    let mut last_event = {
+        let grinder_state_machine_guard = grinder_state_machine.lock().await;
+        let event = grinder_state_machine_guard.as_user_event();
+        state_sender.send(event);
+        event
+    };
+
+    let mut weight_batch = heapless::Vec::<WeightReading, 4>::new();
+    const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 
     loop {
-        let raw_weight = scale_receiver.receive().await;
-        let event = {
-            let mut grinder_state_machine_guard = grinder_state_machine.lock().await;
-            grinder_state_machine_guard.update_weight(raw_weight);
-            grinder_state_machine_guard.as_user_event()
-        };
-        state_sender.send(event);
+        // Try to receive a weight reading with timeout.
+        let raw_weight_opt =
+            embassy_time::with_timeout(BATCH_INTERVAL, scale_receiver.receive()).await;
+
+        if let Ok(raw_weight) = raw_weight_opt {
+            let (event, weight, coffee_weight) = {
+                let mut grinder_state_machine_guard = grinder_state_machine.lock().await;
+                grinder_state_machine_guard.update_weight(raw_weight);
+                let event = grinder_state_machine_guard.as_user_event();
+                let weight = grinder_state_machine_guard
+                    .scale_setting
+                    .translate(raw_weight);
+                let coffee_weight = grinder_state_machine_guard.get_coffee_weight(weight);
+                (event, weight, coffee_weight)
+            };
+            if event != last_event {
+                last_event = event;
+                state_sender.send(event);
+            }
+
+            // Add weight reading to batch
+            let reading = WeightReading {
+                timestamp_ms: Instant::now().as_millis(),
+                weight,
+                state: event,
+                coffee_weight,
+            };
+            let _ = weight_batch.push(reading);
+        }
+
+        if weight_batch.is_full() {
+            weight_batch_sender.try_send(weight_batch.clone()).ok();
+            weight_batch.clear();
+        }
     }
 }
 
@@ -515,7 +825,7 @@ async fn main(spawner: Spawner) {
         channel::Channel::new();
     spawner.must_spawn(scale_task(sck, dt, SCALE_CHANNEL.sender()));
 
-    static STATE_WATCH: watch::Watch<CriticalSectionRawMutex, UserEvent, 1> = watch::Watch::new();
+    static STATE_WATCH: watch::Watch<CriticalSectionRawMutex, UserEvent, 2> = watch::Watch::new();
     spawner.must_spawn(led_task(control, unwrap!(STATE_WATCH.receiver())));
 
     static GRINDER_STATE_MACHINE: StaticCell<
@@ -524,12 +834,29 @@ async fn main(spawner: Spawner) {
     let grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine> =
         GRINDER_STATE_MACHINE.init(mutex::Mutex::new(GrinderStateMachine::new(grinder)));
 
-    bringup_web_server(&spawner, stack, &grinder_state_machine);
+    static WS_REGISTRY: StaticCell<mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>> =
+        StaticCell::new();
+    let ws_registry = WS_REGISTRY.init(mutex::Mutex::new(WsConnectionRegistry::new()));
+
+    static WEIGHT_BATCH_CHANNEL: channel::Channel<
+        CriticalSectionRawMutex,
+        heapless::Vec<WeightReading, 4>,
+        WEIGHT_BATCH_CHANNEL_SIZE,
+    > = channel::Channel::new();
+
+    spawner.must_spawn(websocket_broadcaster_task(
+        unwrap!(STATE_WATCH.receiver()),
+        WEIGHT_BATCH_CHANNEL.receiver(),
+        ws_registry,
+    ));
+
+    bringup_web_server(&spawner, stack, &grinder_state_machine, ws_registry);
 
     info!("Hello, coffee world!");
     controller_task(
         SCALE_CHANNEL.receiver(),
         STATE_WATCH.sender(),
+        WEIGHT_BATCH_CHANNEL.sender(),
         &grinder_state_machine,
     )
     .await;

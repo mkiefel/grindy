@@ -817,6 +817,7 @@ dependencies = [
  "defmt 1.0.1",
  "defmt-rtt",
  "embassy-executor",
+ "embassy-futures",
  "embassy-net",
  "embassy-rp",
  "embassy-sync",
@@ -826,6 +827,8 @@ dependencies = [
  "num-traits",
  "panic-probe",
  "picoserve",
+ "serde",
+ "serde-json-core",
  "static_cell",
 ]
 
