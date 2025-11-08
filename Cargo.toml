@@ -25,7 +25,7 @@ cyw43-pio = { version = "~0.8", features = ["defmt"] }
 static_cell = "~2.1"
 picoserve = { version = "~0.16", features = ["embassy", "log"] }
 serde = { version = "~1.0", default-features = false, features = ["derive"] }
-serde-json-core = "~0.6"
+postcard = { version = "~1.0", default-features = false, features = ["heapless"] }
 
 [[bin]]
 name = "grindy"

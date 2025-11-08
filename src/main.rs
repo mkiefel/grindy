@@ -15,7 +15,6 @@ use embassy_time::{Delay, Duration, Instant, Timer};
 use gpio::{Input, Level, Output};
 use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
-use picoserve::extract::Json;
 use picoserve::response::ws;
 use picoserve::routing::{get, get_service};
 use picoserve::{make_static, AppBuilder, AppRouter};
@@ -50,32 +49,27 @@ async fn net_task(mut stack: embassy_net::Runner<'static, cyw43::NetDriver<'stat
     stack.run().await
 }
 
-#[derive(Serialize)]
-struct StatusResponse {
-    status: UserEvent,
-}
-
 // WebSocket message types
 #[derive(Serialize, Clone)]
-#[serde(tag = "type", rename_all = "camelCase")]
 enum WsMessage {
-    #[serde(rename_all = "camelCase")]
-    Connected { state: UserEvent, timestamp_ms: u64 },
-    #[serde(rename_all = "camelCase")]
-    StateChange { state: UserEvent, timestamp_ms: u64 },
-    #[serde(rename_all = "camelCase")]
+    Connected {
+        state: UserEvent,
+        timestamp_ms: u64,
+    },
+    StateChange {
+        state: UserEvent,
+        timestamp_ms: u64,
+    },
     WeightBatch {
         readings: heapless::Vec<WeightReading, 4>,
     },
 }
 
 #[derive(Serialize, Clone, Copy)]
-#[serde(rename_all = "camelCase")]
 struct WeightReading {
     timestamp_ms: u64,
     weight: f32,
     state: UserEvent,
-    #[serde(skip_serializing_if = "Option::is_none")]
     coffee_weight: Option<f32>,
 }
 
@@ -159,8 +153,9 @@ impl ws::WebSocketCallback for GrinderWebSocket {
             timestamp_ms: Instant::now().as_millis(),
         };
 
-        if let Ok(json) = serde_json_core::to_string::<_, 256>(&connected_msg) {
-            let _ = tx.send_text(&json).await;
+        let mut buf = [0u8; 256];
+        if let Ok(bytes) = postcard::to_slice(&connected_msg, &mut buf) {
+            let _ = tx.send_binary(bytes).await;
         }
 
         // Main loop: handle both broadcast messages and client messages
@@ -173,8 +168,9 @@ impl ws::WebSocketCallback for GrinderWebSocket {
 
             match input {
                 embassy_futures::select::Either::First(msg) => {
-                    if let Ok(json) = serde_json_core::to_string::<_, 512>(&msg) {
-                        if tx.send_text(&json).await.is_err() {
+                    let mut buf = [0u8; 512];
+                    if let Ok(bytes) = postcard::to_slice(&msg, &mut buf) {
+                        if tx.send_binary(bytes).await.is_err() {
                             // Client disconnected.
                             break;
                         }
@@ -240,14 +236,6 @@ impl AppBuilder for AppProps {
                 get_service(picoserve::response::File::javascript(include_str!(
                     "index.js"
                 ))),
-            )
-            .route(
-                "/api/status",
-                get(move || async move {
-                    let grinder_state_machine_guard = grinder_state_machine.lock().await;
-                    let user_event = grinder_state_machine_guard.as_user_event();
-                    Json(StatusResponse { status: user_event })
-                }),
             )
             .route(
                 "/ws",
@@ -616,7 +604,12 @@ impl GrinderStateMachine {
                     // Portafilter removed during stabilization
                     info!("Portafilter removed during stabilization - waiting for placement");
                     GrinderState::WaitingForPortafilter {}
-                } else if weight_diff > WEIGHT_STABILITY_TOLERANCE {
+                } else if weight_diff > WEIGHT_STABILITY_TOLERANCE && sample_count >= 5 {
+                    warn!(
+                        "Weight unstable during stabilization (weight: {}g, portafilter_weight: {}g, diff: {}g) - restarting stabilization",
+                        weight, portafilter_weight,
+                        weight_diff
+                    );
                     // TODO(mkiefel): Make this dependent on sample count.
                     // Weight changed significantly, restart stabilization.
                     GrinderState::Stabilizing {

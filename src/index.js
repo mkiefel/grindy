@@ -1,3 +1,92 @@
+// Postcard binary decoder for deserializing messages from the microcontroller
+class PostcardDecoder {
+  constructor(buffer) {
+    this.view = new DataView(buffer);
+    this.offset = 0;
+  }
+
+  // Decode variable-length integer (varint)
+  // Uses continuation bit encoding: MSB is continuation flag, lower 7 bits are data
+  readVarint() {
+    let value = 0;
+    let shift = 0;
+    while (true) {
+      const byte = this.view.getUint8(this.offset++);
+      value |= (byte & 0x7F) << shift;
+      if ((byte & 0x80) === 0) break;
+      shift += 7;
+    }
+    return value;
+  }
+
+  // Decode 32-bit float (little-endian IEEE 754)
+  readF32() {
+    const value = this.view.getFloat32(this.offset, true); // true = little-endian
+    this.offset += 4;
+    return value;
+  }
+
+  // Decode Option<T> - 0x00 for None, 0x01 for Some(value)
+  readOption(readFn) {
+    const tag = this.view.getUint8(this.offset++);
+    if (tag === 0x00) return null;
+    return readFn.call(this);
+  }
+
+  // Decode UserEvent enum (varint tag: 0=Idle, 1=Stabilizing, 2=Grinding, 3=WaitingForRemoval)
+  readUserEvent() {
+    const variant = this.readVarint();
+    const states = ['Idle', 'Stabilizing', 'Grinding', 'WaitingForRemoval'];
+    return states[variant] || 'Idle';
+  }
+
+  // Decode WeightReading struct
+  readWeightReading() {
+    return {
+      timestampMs: this.readVarint(),
+      weight: this.readF32(),
+      state: this.readUserEvent(),
+      coffeeWeight: this.readOption(this.readF32)
+    };
+  }
+
+  // Decode Vec<T> - varint length followed by elements
+  readVec(readFn) {
+    const length = this.readVarint();
+    const vec = [];
+    for (let i = 0; i < length; i++) {
+      vec.push(readFn.call(this));
+    }
+    return vec;
+  }
+
+  // Decode WsMessage enum (varint tag: 0=Connected, 1=StateChange, 2=WeightBatch)
+  readWsMessage() {
+    const variant = this.readVarint();
+    switch (variant) {
+      case 0: // Connected
+        return {
+          type: 'connected',
+          state: this.readUserEvent(),
+          timestampMs: this.readVarint()
+        };
+      case 1: // StateChange
+        return {
+          type: 'stateChange',
+          state: this.readUserEvent(),
+          timestampMs: this.readVarint()
+        };
+      case 2: // WeightBatch
+        return {
+          type: 'weightBatch',
+          readings: this.readVec(this.readWeightReading)
+        };
+      default:
+        throw new Error(`Unknown WsMessage variant: ${variant}`);
+    }
+  }
+}
+
 let lastStatus = '';
 let currentWeight = 0;
 let currentProgress = 0;
@@ -25,7 +114,6 @@ function addLog(msg) {
 function updateUI(status, weight = null, progress = null) {
   const statusText = document.getElementById('status-text');
   const statusContainer = document.getElementById('status-container');
-  const statusMsg = document.getElementById('status-msg');
 
   // Update status
   const displayStatus = status === 'WaitingForRemoval' ? 'Waiting for Removal' : status;
@@ -79,9 +167,10 @@ function handleWeightBatch(readings) {
   }
 }
 
-function handleMessage(data) {
+function handleMessage(arrayBuffer) {
   try {
-    const msg = JSON.parse(data);
+    const decoder = new PostcardDecoder(arrayBuffer);
+    const msg = decoder.readWsMessage();
 
     switch (msg.type) {
       case 'connected':
@@ -102,7 +191,7 @@ function handleMessage(data) {
         console.warn('Unknown message type:', msg.type);
     }
   } catch (e) {
-    console.error('Failed to parse WebSocket message:', e, data);
+    console.error('Failed to decode WebSocket message:', e);
   }
 }
 
@@ -120,6 +209,7 @@ function connectWebSocket() {
   addLog('Connecting...');
 
   ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer'; // Receive binary data as ArrayBuffer
 
   ws.onopen = () => {
     console.log('WebSocket connected');
@@ -128,6 +218,7 @@ function connectWebSocket() {
   };
 
   ws.onmessage = (event) => {
+    // With binaryType='arraybuffer', event.data is an ArrayBuffer
     handleMessage(event.data);
   };
 
