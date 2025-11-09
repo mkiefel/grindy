@@ -1,7 +1,8 @@
 #![no_std]
 #![no_main]
-#![feature(impl_trait_in_assoc_type)]
+#![feature(impl_trait_in_assoc_type, core_float_math)]
 
+use core::f32;
 use cyw43::{Control, NetDriver};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
@@ -321,7 +322,7 @@ async fn scale_task(
     debug!("Setting up scale...");
     let delay = Delay {};
     let mut scale = loadcell::hx711::HX711::new(sck, dt, delay);
-    scale.set_gain_mode(GainMode::A64);
+    scale.set_gain_mode(GainMode::A128);
 
     loop {
         if scale.is_ready() {
@@ -518,19 +519,20 @@ struct GrinderStateMachine {
     state: Option<GrinderState>,
 }
 
+const CALIBRATION_SAMPLE_COUNT: usize = 200;
+const SAMPLE_COUNT: usize = 100;
+
 enum GrinderState {
     Tare {
-        samples: heapless::Vec<f32, 100>,
+        samples: heapless::Vec<f32, CALIBRATION_SAMPLE_COUNT>,
     },
     WaitingForCalibration {},
     Calibrating {
-        samples: heapless::Vec<f32, 100>,
+        samples: heapless::Vec<f32, CALIBRATION_SAMPLE_COUNT>,
     },
     WaitingForPortafilter {},
     Stabilizing {
-        start_time: Instant,
-        portafilter_weight: f32,
-        sample_count: usize,
+        samples: heapless::Vec<f32, SAMPLE_COUNT>,
     },
     Grinding {
         start_time: Instant,
@@ -546,7 +548,7 @@ impl GrinderStateMachine {
             scale_setting: ScaleSetting {
                 offset: 0.0,
                 inv_variance: 0.0,
-                factor: 200.0 / 85314.55,
+                factor: 200.0 / 85314.55 * 0.478242,
             },
             state: Some(GrinderState::Tare {
                 samples: heapless::Vec::new(),
@@ -584,10 +586,6 @@ impl GrinderStateMachine {
         const REMOVAL_THRESHOLD: f32 = 10.0;
         // Target coffee weight in grams.
         const TARGET_COFFEE_WEIGHT: f32 = 18.0;
-        // Time to wait for weight stabilization.
-        const STABILIZATION_TIME: Duration = Duration::from_secs(2);
-        // Tolerance for weight stability (grams).
-        const WEIGHT_STABILITY_TOLERANCE: f32 = 1.0;
 
         let weight = self.scale_setting.translate(raw_weight);
         debug!("weight: {}", weight);
@@ -645,41 +643,37 @@ impl GrinderStateMachine {
                     info!("Portafilter detected! Weight: {}g - stabilizing...", weight);
 
                     GrinderState::Stabilizing {
-                        start_time: Instant::now(),
-                        portafilter_weight: weight,
-                        sample_count: 1,
+                        samples: heapless::Vec::from_slice(&[weight]).unwrap(),
                     }
                 } else {
                     GrinderState::WaitingForPortafilter {}
                 }
             }
 
-            GrinderState::Stabilizing {
-                start_time,
-                portafilter_weight,
-                sample_count,
-            } => {
-                // Check if weight is stable (within tolerance of initial portafilter weight).
-                let weight_diff = (weight - portafilter_weight).abs();
+            GrinderState::Stabilizing { mut samples } => {
+                samples.push(weight).unwrap();
+
+                let (portafilter_weight, _) =
+                    compute_mean_variance(&mut samples, 3.0).unwrap_or((weight, 0.0));
+
+                let threshold = f32::math::sqrt(
+                    1.0 / self.scale_setting.inv_variance * self.scale_setting.factor.powi(2),
+                ) * 3.0;
 
                 if weight < PORTAFILTER_THRESHOLD {
                     // Portafilter removed during stabilization
                     info!("Portafilter removed during stabilization - waiting for placement");
                     GrinderState::WaitingForPortafilter {}
-                } else if weight_diff > WEIGHT_STABILITY_TOLERANCE && sample_count >= 5 {
+                } else if samples.len() > 5 && (weight - portafilter_weight).abs() > threshold {
                     warn!(
-                        "Weight unstable during stabilization (weight: {}g, portafilter_weight: {}g, diff: {}g) - restarting stabilization",
-                        weight, portafilter_weight,
-                        weight_diff
+                        "Weight unstable during stabilization (weight: {}g, portafilter_weight: {}g, threshold: {}g) - restarting stabilization",
+                        weight, portafilter_weight, threshold
+
                     );
-                    // TODO(mkiefel): Make this dependent on sample count.
-                    // Weight changed significantly, restart stabilization.
                     GrinderState::Stabilizing {
-                        start_time: Instant::now(),
-                        portafilter_weight: weight,
-                        sample_count: 1,
+                        samples: heapless::Vec::from_slice(&[weight]).unwrap(),
                     }
-                } else if Instant::now() - start_time >= STABILIZATION_TIME {
+                } else if samples.is_full() {
                     // TODO(mkiefel): Make this dependent on sample count.
                     info!("Weight stabilized at {}g - starting grind!", weight);
                     self.grinder.set_low();
@@ -688,13 +682,7 @@ impl GrinderStateMachine {
                         portafilter_weight,
                     }
                 } else {
-                    GrinderState::Stabilizing {
-                        start_time,
-                        portafilter_weight: (sample_count as f32) / (sample_count as f32 + 1.0)
-                            * portafilter_weight
-                            + weight / (sample_count as f32 + 1.0),
-                        sample_count: sample_count + 1,
-                    }
+                    GrinderState::Stabilizing { samples }
                 }
             }
 
