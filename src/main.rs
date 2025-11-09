@@ -168,7 +168,7 @@ impl ws::WebSocketCallback for GrinderWebSocket {
 
             match input {
                 embassy_futures::select::Either::First(msg) => {
-                    let mut buf = [0u8; 512];
+                    let mut buf = [0u8; 128];
                     if let Ok(bytes) = postcard::to_slice(&msg, &mut buf) {
                         if tx.send_binary(bytes).await.is_err() {
                             // Client disconnected.
@@ -428,12 +428,76 @@ fn bringup_web_server(
 
 struct ScaleSetting {
     offset: f32,
+    inv_variance: f32,
     factor: f32,
 }
 
 impl ScaleSetting {
     fn translate(&self, raw: f32) -> f32 {
         (raw - self.offset) * self.factor
+    }
+}
+
+/// Compute mean and variance with additional removal of outlier based on Median Absolute Deviation
+/// (MAD).
+pub fn compute_mean_variance<const N: usize>(
+    data: &mut heapless::Vec<f32, N>,
+    threshold: f32,
+) -> Option<(f32, f32)> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let median = compute_median(data);
+    let mut deviations: heapless::Vec<f32, N> = data.iter().map(|&x| (x - median).abs()).collect();
+    let mad = compute_median(&mut deviations);
+
+    // Avoid division by zero if MAD is 0 (all values identical).
+    if mad < f32::EPSILON {
+        return None;
+    }
+
+    // Filter outliers using modified z-score.
+    // TODO: Remove duplication.
+    let mean = data
+        .iter()
+        .filter(|&&x| {
+            let modified_z = 0.6745f32 * (x - median).abs() / mad;
+            modified_z < threshold
+        })
+        .fold((0.0f32, 0), |(mean, count), v| {
+            (
+                mean * (count as f32) / (count as f32 + 1.0f32) + v / (count as f32 + 1.0f32),
+                count + 1,
+            )
+        })
+        .0;
+    let variance = data
+        .iter()
+        .filter(|&&x| {
+            let modified_z = 0.6745f32 * (x - median).abs() / mad;
+            modified_z < threshold
+        })
+        .map(|&x| (x - mean).powi(2))
+        .fold((0.0f32, 0), |(mean, count), v| {
+            (
+                mean * (count as f32) / (count as f32 + 1.0f32) + v / (count as f32 + 1.0f32),
+                count + 1,
+            )
+        })
+        .0;
+    Some((mean, variance))
+}
+
+/// Compute median in place.
+fn compute_median<const N: usize>(data: &mut heapless::Vec<f32, N>) -> f32 {
+    data.sort_unstable_by(|a: &f32, b: &f32| a.partial_cmp(b).unwrap());
+
+    let len = data.len();
+    if len % 2 == 0 {
+        (data[len / 2 - 1] + data[len / 2]) / 2.0
+    } else {
+        data[len / 2]
     }
 }
 
@@ -447,13 +511,11 @@ struct GrinderStateMachine {
 
 enum GrinderState {
     Tare {
-        mean_offset: f32,
-        sample_count: usize,
+        samples: heapless::Vec<f32, 100>,
     },
     WaitingForCalibration {},
     Calibrating {
-        mean_weight: f32,
-        sample_count: usize,
+        samples: heapless::Vec<f32, 100>,
     },
     WaitingForPortafilter {},
     Stabilizing {
@@ -474,11 +536,11 @@ impl GrinderStateMachine {
             grinder,
             scale_setting: ScaleSetting {
                 offset: 0.0,
+                inv_variance: 0.0,
                 factor: 200.0 / 85314.55,
             },
             state: Some(GrinderState::Tare {
-                mean_offset: 0.0,
-                sample_count: 0,
+                samples: heapless::Vec::new(),
             }),
         }
     }
@@ -521,23 +583,20 @@ impl GrinderStateMachine {
         let weight = self.scale_setting.translate(raw_weight);
         debug!("weight: {}", weight);
         self.state = Some(match self.state.take().unwrap() {
-            GrinderState::Tare {
-                mean_offset,
-                sample_count,
-            } => {
-                // TODO(mkiefel): Estimate variance here as well to use it later for the estimation
-                // of weights.
-                let new_mean_offset = (mean_offset * (sample_count as f32) + raw_weight)
-                    / (sample_count as f32 + 1.0);
-                if sample_count >= 30 {
-                    info!("Tare complete. Offset: {}", new_mean_offset);
+            GrinderState::Tare { mut samples } => {
+                if samples.is_full() {
+                    let (new_mean_offset, variance) =
+                        compute_mean_variance(&mut samples, 3.0).unwrap_or((0.0, 0.0));
+                    info!(
+                        "Tare complete. Offset: {}, Variance: {}",
+                        new_mean_offset, variance
+                    );
                     self.scale_setting.offset = new_mean_offset;
+                    self.scale_setting.inv_variance = 1.0 / variance.max(1.0);
                     GrinderState::WaitingForCalibration {}
                 } else {
-                    GrinderState::Tare {
-                        mean_offset: new_mean_offset,
-                        sample_count: sample_count + 1,
-                    }
+                    samples.push(raw_weight).unwrap();
+                    GrinderState::Tare { samples }
                 }
             }
 
@@ -548,33 +607,27 @@ impl GrinderStateMachine {
                         weight
                     );
                     GrinderState::Calibrating {
-                        mean_weight: weight,
-                        sample_count: 1,
+                        samples: heapless::Vec::new(),
                     }
                 } else {
                     GrinderState::WaitingForCalibration {}
                 }
             }
 
-            GrinderState::Calibrating {
-                mean_weight,
-                sample_count,
-            } => {
-                let new_mean_weight =
-                    (mean_weight * (sample_count as f32) + weight) / (sample_count as f32 + 1.0);
-                if sample_count >= 200 {
+            GrinderState::Calibrating { mut samples } => {
+                if samples.is_full() {
+                    let (new_mean_weight, _variance) = compute_mean_variance(&mut samples, 3.0)
+                        .unwrap_or((CALIBRATION_WEIGHT, 0.0));
                     let factor = CALIBRATION_WEIGHT / new_mean_weight;
                     info!(
-                        "Calibration complete. Offset: {}g, Factor: {}",
+                        "Calibration complete. Offset: {}g,  Factor: {}",
                         new_mean_weight, factor
                     );
                     self.scale_setting.factor *= factor;
                     GrinderState::WaitingForRemoval {}
                 } else {
-                    GrinderState::Calibrating {
-                        mean_weight: new_mean_weight,
-                        sample_count: sample_count + 1,
-                    }
+                    samples.push(weight).unwrap();
+                    GrinderState::Calibrating { samples }
                 }
             }
 
