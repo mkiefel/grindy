@@ -328,7 +328,7 @@ async fn scale_task(
         if scale.is_ready() {
             match scale.read() {
                 Ok(r) => {
-                    sender.send(r as f32).await;
+                    sender.send(-r as f32).await;
                 }
                 Err(_) => {
                     warn!("Failed to read scale although it was ready.");
@@ -519,8 +519,8 @@ struct GrinderStateMachine {
     state: Option<GrinderState>,
 }
 
-const CALIBRATION_SAMPLE_COUNT: usize = 200;
-const SAMPLE_COUNT: usize = 100;
+const CALIBRATION_SAMPLE_COUNT: usize = 25;
+const SAMPLE_COUNT: usize = 15;
 
 enum GrinderState {
     Tare {
@@ -548,7 +548,7 @@ impl GrinderStateMachine {
             scale_setting: ScaleSetting {
                 offset: 0.0,
                 inv_variance: 0.0,
-                factor: 200.0 / 85314.55 * 0.478242,
+                factor: 200.0 / 85314.55 * 0.478242 * 1.049868,
             },
             state: Some(GrinderState::Tare {
                 samples: heapless::Vec::new(),
