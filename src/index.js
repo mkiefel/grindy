@@ -40,6 +40,15 @@ class PostcardDecoder {
     return states[variant] || 'Idle';
   }
 
+  // Decode ScaleSetting struct
+  readScaleSetting() {
+    return {
+      offset: this.readF32(),
+      inv_variance: this.readF32(),
+      factor: this.readF32()
+    };
+  }
+
   // Decode WeightReading struct
   readWeightReading() {
     return {
@@ -68,7 +77,8 @@ class PostcardDecoder {
         return {
           type: 'connected',
           state: this.readUserEvent(),
-          timestampMs: this.readVarint()
+          scaleSetting: this.readScaleSetting(),
+          timestampMs: this.readVarint(),
         };
       case 1: // StateChange
         return {
@@ -111,7 +121,7 @@ function addLog(msg) {
   if (logs.children.length > 20) logs.removeChild(logs.lastChild);
 }
 
-function updateUI(status, weight = null, progress = null) {
+function updateUI(status, weight = null, progress = null, scaleSetting = null) {
   const statusText = document.getElementById('status-text');
   const statusContainer = document.getElementById('status-container');
 
@@ -122,6 +132,13 @@ function updateUI(status, weight = null, progress = null) {
   // Update CSS class
   Object.values(statusMap).forEach(c => statusContainer.classList.remove(c));
   statusContainer.classList.add(statusMap[status] || 'idle');
+
+  if (scaleSetting !== null) {
+    document.getElementById('scale-offset').textContent = scaleSetting.offset.toFixed(2);
+    document.getElementById('scale-std').textContent = Math.sqrt(
+      1.0 / scaleSetting.inv_variance * Math.pow(scaleSetting.factor, 2)).toFixed(2);
+    document.getElementById('scale-factor').textContent = scaleSetting.factor.toFixed(4);
+  }
 
   // Update weight if provided
   if (weight !== null) {
@@ -175,7 +192,7 @@ function handleMessage(arrayBuffer) {
     switch (msg.type) {
       case 'connected':
         addLog('Connected to Grindy');
-        updateUI(msg.state);
+        updateUI(msg.state, null, null, msg.scaleSetting);
         break;
 
       case 'stateChange':

@@ -54,6 +54,7 @@ async fn net_task(mut stack: embassy_net::Runner<'static, cyw43::NetDriver<'stat
 enum WsMessage {
     Connected {
         state: UserEvent,
+        scale_setting: ScaleSetting,
         timestamp_ms: u64,
     },
     StateChange {
@@ -147,9 +148,16 @@ impl ws::WebSocketCallback for GrinderWebSocket {
         info!("WebSocket client {} connected", conn_id);
 
         // Send initial connected message with current state
-        let current_state = self.grinder_state_machine.lock().await.as_user_event();
+        let (current_state, scale_setting) = {
+            let grinder_state_machine = self.grinder_state_machine.lock().await;
+            (
+                grinder_state_machine.as_user_event(),
+                grinder_state_machine.scale_setting.clone(),
+            )
+        };
         let connected_msg = WsMessage::Connected {
             state: current_state,
+            scale_setting,
             timestamp_ms: Instant::now().as_millis(),
         };
 
@@ -426,6 +434,7 @@ fn bringup_web_server(
     }
 }
 
+#[derive(Clone, Serialize)]
 struct ScaleSetting {
     offset: f32,
     inv_variance: f32,
@@ -438,8 +447,8 @@ impl ScaleSetting {
     }
 }
 
-/// Compute mean and variance with additional removal of outlier based on Median Absolute Deviation
-/// (MAD).
+/// Compute mean and variance in place with additional removal of outlier based on Median Absolute
+/// Deviation (MAD).
 pub fn compute_mean_variance<const N: usize>(
     data: &mut heapless::Vec<f32, N>,
     threshold: f32,
