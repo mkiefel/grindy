@@ -600,7 +600,7 @@ impl GrinderStateMachine {
                     );
                     self.scale_setting.offset = new_mean_offset;
                     self.scale_setting.inv_variance = 1.0 / variance.max(1.0);
-                    GrinderState::WaitingForCalibration {}
+                    GrinderState::WaitingForPortafilter {}
                 } else {
                     samples.push(raw_weight).unwrap();
                     GrinderState::Tare { samples }
