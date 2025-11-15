@@ -538,7 +538,9 @@ enum GrinderState {
         start_time: Instant,
         portafilter_weight: f32,
     },
-    WaitingForRemoval {},
+    WaitingForRemoval {
+        portafilter_weight: f32,
+    },
 }
 
 impl GrinderStateMachine {
@@ -571,6 +573,9 @@ impl GrinderStateMachine {
     fn get_coffee_weight(&self, current_weight: f32) -> Option<f32> {
         match self.state.as_ref().unwrap() {
             GrinderState::Grinding {
+                portafilter_weight, ..
+            } => Some(current_weight - portafilter_weight),
+            GrinderState::WaitingForRemoval {
                 portafilter_weight, ..
             } => Some(current_weight - portafilter_weight),
             _ => None,
@@ -631,7 +636,9 @@ impl GrinderStateMachine {
                         new_mean_weight, factor
                     );
                     self.scale_setting.factor *= factor;
-                    GrinderState::WaitingForRemoval {}
+                    GrinderState::WaitingForRemoval {
+                        portafilter_weight: 0.0,
+                    }
                 } else {
                     samples.push(weight).unwrap();
                     GrinderState::Calibrating { samples }
@@ -707,7 +714,7 @@ impl GrinderStateMachine {
                         (coffee_weight * 10.0).floor() / 10.0
                     );
                     self.grinder.set_high();
-                    GrinderState::WaitingForRemoval {}
+                    GrinderState::WaitingForRemoval { portafilter_weight }
                 } else {
                     GrinderState::Grinding {
                         start_time,
@@ -716,12 +723,12 @@ impl GrinderStateMachine {
                 }
             }
 
-            GrinderState::WaitingForRemoval {} => {
+            GrinderState::WaitingForRemoval { portafilter_weight } => {
                 if weight < REMOVAL_THRESHOLD {
                     info!("Portafilter removed - ready for next cycle");
                     GrinderState::WaitingForPortafilter {}
                 } else {
-                    GrinderState::WaitingForRemoval {}
+                    GrinderState::WaitingForRemoval { portafilter_weight }
                 }
             }
         })
