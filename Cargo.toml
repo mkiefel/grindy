@@ -26,6 +26,7 @@ static_cell = "~2.1"
 picoserve = { git = "https://github.com/sammhicks/picoserve.git", rev = "e0f9418b201ae4e3ef0386324d3e37c6a6b68b8a", features = ["embassy", "log", "ws"] }
 serde = { version = "~1.0", default-features = false, features = ["derive"] }
 postcard = { version = "~1.0", default-features = false, features = ["heapless"] }
+smart-leds = "~0.4"
 
 [[bin]]
 name = "grindy"
