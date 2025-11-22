@@ -863,8 +863,8 @@ async fn main(spawner: Spawner) {
 
     let grinder = Output::new(p.PIN_0, Level::High);
 
-    let dt = Input::new(p.PIN_17, Pull::Down);
-    let sck = Output::new(p.PIN_16, Level::Low);
+    let dt = Input::new(p.PIN_18, Pull::Down);
+    let sck = Output::new(p.PIN_19, Level::Low);
 
     static SCALE_CHANNEL: channel::Channel<CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE> =
         channel::Channel::new();
