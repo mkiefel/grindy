@@ -225,7 +225,7 @@ function connectWebSocket() {
 
   addLog('Connecting...');
 
-  ws = new WebSocket(wsUrl);
+  ws = new WebSocket(wsUrl, ["grindy"]);
   ws.binaryType = 'arraybuffer'; // Receive binary data as ArrayBuffer
 
   ws.onopen = () => {

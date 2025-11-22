@@ -273,11 +273,13 @@ impl AppBuilder for AppProps {
                             idx
                         };
 
-                        upgrade.on_upgrade(GrinderWebSocket {
-                            registry: ws_registry,
-                            grinder_state_machine,
-                            signal: &WS_SIGNALS[signal_idx],
-                        })
+                        upgrade
+                            .on_upgrade(GrinderWebSocket {
+                                registry: ws_registry,
+                                grinder_state_machine,
+                                signal: &WS_SIGNALS[signal_idx],
+                            })
+                            .with_protocol("grindy")
                     },
                 ),
             )
