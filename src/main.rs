@@ -16,6 +16,7 @@ use embassy_time::{Delay, Duration, Instant, Timer};
 use gpio::{Input, Level, Output};
 use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
+use picoserve::futures::Either;
 use picoserve::response::ws;
 use picoserve::routing::{get, get_service};
 use picoserve::{make_static, AppBuilder, AppRouter};
@@ -170,13 +171,26 @@ impl ws::WebSocketCallback for GrinderWebSocket {
         // Main loop: handle both broadcast messages and client messages
         let mut buffer = [0u8; 128];
         loop {
-            // Check for broadcast message or client message.
-            let input =
-                embassy_futures::select::select(self.signal.wait(), rx.next_message(&mut buffer))
-                    .await;
-
-            match input {
-                embassy_futures::select::Either::First(msg) => {
+            match rx.next_message(&mut buffer, self.signal.wait()).await {
+                Ok(Either::First(msg)) => {
+                    match msg {
+                        Ok(ws::Message::Close(_)) => {
+                            info!("WebSocket client {} closed connection", conn_id);
+                            break;
+                        }
+                        Ok(ws::Message::Ping(data)) => {
+                            if tx.send_pong(data).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {} // Ignore other messages
+                        Err(_) => {
+                            warn!("WebSocket client {} read error", conn_id);
+                            break;
+                        }
+                    }
+                }
+                Ok(Either::Second(msg)) => {
                     let mut buf = [0u8; 128];
                     if let Ok(bytes) = postcard::to_slice(&msg, &mut buf) {
                         if tx.send_binary(bytes).await.is_err() {
@@ -185,29 +199,15 @@ impl ws::WebSocketCallback for GrinderWebSocket {
                         }
                     } else {
                         warn!(
-                            "Failed to serialize WebSocket message for client {}",
+                            "WebSocket client {} failed to serialize WebSocket message for client",
                             conn_id
                         );
                     }
                 }
-                embassy_futures::select::Either::Second(result) => match result {
-                    Ok(msg) => match msg {
-                        ws::Message::Close(_) => {
-                            info!("WebSocket client {} closed connection", conn_id);
-                            break;
-                        }
-                        ws::Message::Ping(data) => {
-                            if tx.send_pong(data).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => {} // Ignore other messages
-                    },
-                    Err(_) => {
-                        warn!("WebSocket client {} read error", conn_id);
-                        break;
-                    }
-                },
+                Err(_) => {
+                    warn!("WebSocket client synchronization error {}", conn_id);
+                    break;
+                }
             }
         }
 
@@ -294,21 +294,14 @@ async fn web_task(
     config: &'static picoserve::Config<Duration>,
 ) -> ! {
     let port = 80;
-    let mut tcp_rx_buffer = [0; 1024];
-    let mut tcp_tx_buffer = [0; 1024];
-    let mut http_buffer = [0; 2048];
+    let mut tcp_rx_buffer = [0; 1024 * 2];
+    let mut tcp_tx_buffer = [0; 1024 * 2];
+    let mut http_buffer = [0; 2048 * 2];
 
-    picoserve::listen_and_serve(
-        task_id,
-        app,
-        config,
-        stack,
-        port,
-        &mut tcp_rx_buffer,
-        &mut tcp_tx_buffer,
-        &mut http_buffer,
-    )
-    .await
+    picoserve::Server::new(app, config, &mut http_buffer)
+        .listen_and_serve(task_id, stack, port, &mut tcp_rx_buffer, &mut tcp_tx_buffer)
+        .await
+        .into_never()
 }
 
 const SCALE_CHANNEL_SIZE: usize = 5;

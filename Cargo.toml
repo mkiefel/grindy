@@ -23,7 +23,7 @@ embassy-futures = "~0.1"
 cyw43 = { version = "~0.5", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "~0.8", features = ["defmt"] }
 static_cell = "~2.1"
-picoserve = { version = "~0.16", features = ["embassy", "log"] }
+picoserve = { version = "~0.17.1", features = ["embassy", "log", "ws"] }
 serde = { version = "~1.0", default-features = false, features = ["derive"] }
 postcard = { version = "~1.0", default-features = false, features = ["heapless"] }
 
