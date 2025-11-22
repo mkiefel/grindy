@@ -3,7 +3,7 @@
 #![feature(impl_trait_in_assoc_type, core_float_math)]
 
 use core::f32;
-use cyw43::{Control, NetDriver};
+use cyw43::{Control, JoinOptions, NetDriver};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
@@ -386,7 +386,7 @@ fn bringup_network_stack(
     let (stack, runner) = embassy_net::new(
         net_device,
         embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
-            address: embassy_net::Ipv4Cidr::new(core::net::Ipv4Addr::new(192, 168, 22, 1), 24),
+            address: embassy_net::Ipv4Cidr::new(core::net::Ipv4Addr::new(192, 168, 1, 9), 24),
             gateway: None,
             dns_servers: Default::default(),
         }),
@@ -859,7 +859,24 @@ async fn main(spawner: Spawner) {
     control.init(clm).await;
 
     let stack = bringup_network_stack(&spawner, net_device);
-    control.start_ap_wpa2("grindy", "grindyrockz", 8).await;
+
+    while let Err(err) = control
+        .join(
+            env!("GRINDY_WIFI_SSID"),
+            JoinOptions::new(env!("GRINDY_WIFI_PASSWORD").as_bytes()),
+        )
+        .await
+    {
+        info!("Join failed with status: {}", err.status)
+    }
+
+    info!("Waiting for link...");
+    stack.wait_link_up().await;
+
+    info!("Waiting for config...");
+    stack.wait_config_up().await;
+
+    info!("Stack is up.");
 
     let grinder = Output::new(p.PIN_0, Level::High);
 
