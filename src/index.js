@@ -33,10 +33,10 @@ class PostcardDecoder {
     return readFn.call(this);
   }
 
-  // Decode UserEvent enum (varint tag: 0=Idle, 1=Stabilizing, 2=Grinding, 3=WaitingForRemoval)
+  // Decode UserEvent enum (varint tag: 0=Initializing, 1=Idle, 2=Stabilizing, 3=Grinding, 4=WaitingForRemoval)
   readUserEvent() {
     const variant = this.readVarint();
-    const states = ['Idle', 'Stabilizing', 'Grinding', 'WaitingForRemoval'];
+    const states = ['Initializing', 'Idle', 'Stabilizing', 'Grinding', 'WaitingForRemoval'];
     return states[variant] || 'Idle';
   }
 
@@ -105,6 +105,7 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 30000; // 30 seconds
 
 const statusMap = {
+  'Initializing': 'initializing',
   'Idle': 'idle',
   'Stabilizing': 'stabilizing',
   'Grinding': 'grinding',

@@ -7,7 +7,7 @@ use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
 use serde::Serialize;
 
-use crate::ui::UserEvent;
+use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
 
 pub const WEIGHT_BATCH_CHANNEL_SIZE: usize = 2;
 pub const SCALE_CHANNEL_SIZE: usize = 5;
@@ -191,9 +191,11 @@ impl GrinderStateMachine {
 
     pub fn as_user_event(&self) -> UserEvent {
         match self.state.as_ref().unwrap() {
-            GrinderState::Tare { .. }
-            | GrinderState::WaitingForPortafilter { .. }
-            | GrinderState::WaitingForCalibration {} => UserEvent::Idle,
+            GrinderState::Tare { .. } => UserEvent::Initializing,
+
+            GrinderState::WaitingForPortafilter {} | GrinderState::WaitingForCalibration { .. } => {
+                UserEvent::Idle
+            }
             GrinderState::Calibrating { .. } => UserEvent::Stabilizing,
             GrinderState::Stabilizing { .. } => UserEvent::Stabilizing,
             GrinderState::Grinding { .. } => UserEvent::Grinding,
@@ -372,7 +374,12 @@ impl GrinderStateMachine {
 
 pub async fn controller_task(
     scale_receiver: channel::Receiver<'static, CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE>,
-    state_sender: watch::Sender<'static, CriticalSectionRawMutex, UserEvent, 2>,
+    state_sender: watch::Sender<
+        'static,
+        CriticalSectionRawMutex,
+        UserEvent,
+        USER_EVENT_CHANNEL_SIZE,
+    >,
     weight_batch_sender: channel::Sender<
         'static,
         CriticalSectionRawMutex,

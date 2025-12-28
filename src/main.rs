@@ -26,7 +26,7 @@ use crate::scale::{
     controller_task, scale_task, GrinderStateMachine, WeightReading, SCALE_CHANNEL_SIZE,
     WEIGHT_BATCH_CHANNEL_SIZE,
 };
-use crate::ui::{led_strip_task, led_task, UserEvent};
+use crate::ui::{led_strip_task, led_task, UserEvent, USER_EVENT_CHANNEL_SIZE};
 use crate::web::{
     bringup_web_server, websocket_broadcaster_task, WsConnectionRegistry, WEB_TASK_POOL_SIZE,
 };
@@ -83,11 +83,9 @@ fn bringup_network_stack(
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
-    let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
 
+    // Bring up some UI early to show errors.
     let mut led_strip_pio = Pio::new(p.PIO1, Irqs);
-
     let program = PioWs2812Program::new(&mut led_strip_pio.common);
     let ws2812 = PioWs2812::new(
         &mut led_strip_pio.common,
@@ -96,7 +94,13 @@ async fn main(spawner: Spawner) {
         p.PIN_1,
         &program,
     );
-    spawner.must_spawn(led_strip_task(ws2812));
+    static STATE_WATCH: watch::Watch<CriticalSectionRawMutex, UserEvent, USER_EVENT_CHANNEL_SIZE> =
+        watch::Watch::new();
+    STATE_WATCH.sender().send(UserEvent::Initializing);
+    spawner.must_spawn(led_strip_task(ws2812, unwrap!(STATE_WATCH.receiver())));
+
+    let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
+    let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -147,7 +151,6 @@ async fn main(spawner: Spawner) {
         channel::Channel::new();
     spawner.must_spawn(scale_task(sck, dt, SCALE_CHANNEL.sender()));
 
-    static STATE_WATCH: watch::Watch<CriticalSectionRawMutex, UserEvent, 2> = watch::Watch::new();
     spawner.must_spawn(led_task(control, unwrap!(STATE_WATCH.receiver())));
 
     static GRINDER_STATE_MACHINE: StaticCell<

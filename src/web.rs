@@ -9,7 +9,7 @@ use picoserve::{make_static, AppBuilder, AppRouter};
 use serde::Serialize;
 
 use crate::scale::{GrinderStateMachine, ScaleSetting, WeightReading, WEIGHT_BATCH_CHANNEL_SIZE};
-use crate::ui::UserEvent;
+use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
 
 pub const WEB_TASK_POOL_SIZE: usize = 8;
 
@@ -260,7 +260,12 @@ async fn web_task(
 
 #[embassy_executor::task]
 pub async fn websocket_broadcaster_task(
-    mut state_receiver: watch::Receiver<'static, CriticalSectionRawMutex, UserEvent, 2>,
+    mut state_receiver: watch::Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        UserEvent,
+        USER_EVENT_CHANNEL_SIZE,
+    >,
     weight_batch_receiver: channel::Receiver<
         'static,
         CriticalSectionRawMutex,

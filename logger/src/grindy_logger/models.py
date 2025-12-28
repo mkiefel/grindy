@@ -10,10 +10,11 @@ T = TypeVar('T')
 
 class UserEvent(IntEnum):
     """Grinder state events matching Rust UserEvent enum."""
-    Idle = 0
-    Stabilizing = 1
-    Grinding = 2
-    WaitingForRemoval = 3
+    Initializing = 0
+    Idle = 1
+    Stabilizing = 2
+    Grinding = 3
+    WaitingForRemoval = 4
 
 
 @dataclass
