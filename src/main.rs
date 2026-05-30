@@ -65,11 +65,7 @@ fn bringup_network_stack(
 ) -> embassy_net::Stack<'static> {
     let (stack, runner) = embassy_net::new(
         net_device,
-        embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
-            address: embassy_net::Ipv4Cidr::new(core::net::Ipv4Addr::new(192, 168, 1, 9), 24),
-            gateway: None,
-            dns_servers: Default::default(),
-        }),
+        embassy_net::Config::dhcpv4(Default::default()),
         make_static!(
             embassy_net::StackResources::<WEB_TASK_POOL_SIZE>,
             embassy_net::StackResources::new()
