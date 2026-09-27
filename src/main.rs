@@ -2,7 +2,7 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type, core_float_math)]
 
-use cyw43::NetDriver;
+use cyw43::{Control, NetDriver};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
@@ -57,6 +57,31 @@ async fn cyw43_task(
 #[embassy_executor::task]
 pub async fn net_task(mut stack: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     stack.run().await
+}
+
+#[embassy_executor::task]
+async fn network_setup_task(
+    spawner: Spawner,
+    mut control: Control<'static>,
+    stack: embassy_net::Stack<'static>,
+    ssid: &'static str,
+    password: &'static str,
+    state_receiver: watch::Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        UserEvent,
+        USER_EVENT_CHANNEL_SIZE,
+    >,
+    grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
+    ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
+) {
+    let wifi_connected = join_wifi(&mut control, stack, ssid, password).await;
+    if wifi_connected {
+        bringup_web_server(&spawner, stack, grinder_state_machine, ws_registry);
+    } else {
+        warn!("WiFi not connected; skipping web server bringup");
+    }
+    spawner.must_spawn(wifi_task(control, state_receiver));
 }
 
 fn bringup_network_stack(
@@ -120,16 +145,6 @@ async fn main(spawner: Spawner) {
 
     let stack = bringup_network_stack(&spawner, net_device);
 
-    let wifi_connected = join_wifi(
-        &mut control,
-        stack,
-        env!("GRINDY_WIFI_SSID"),
-        env!("GRINDY_WIFI_PASSWORD"),
-    )
-    .await;
-
-    spawner.must_spawn(wifi_task(control, unwrap!(STATE_WATCH.receiver())));
-
     let grinder = Output::new(p.PIN_0, Level::High);
 
     let dt = Input::new(p.PIN_18, Pull::Down);
@@ -161,11 +176,16 @@ async fn main(spawner: Spawner) {
         ws_registry,
     ));
 
-    if wifi_connected {
-        bringup_web_server(&spawner, stack, grinder_state_machine, ws_registry);
-    } else {
-        warn!("WiFi not connected; skipping web server bringup");
-    }
+    spawner.must_spawn(network_setup_task(
+        spawner,
+        control,
+        stack,
+        env!("GRINDY_WIFI_SSID"),
+        env!("GRINDY_WIFI_PASSWORD"),
+        unwrap!(STATE_WATCH.receiver()),
+        grinder_state_machine,
+        ws_registry,
+    ));
 
     info!("Hello, coffee world!");
     controller_task(
