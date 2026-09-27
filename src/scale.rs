@@ -159,12 +159,30 @@ const DEFAULT_FACTOR: f32 = 200.0 / 85314.55 * 0.478242 * 1.049868 / 50.3 * 48.0
 const CALIBRATION_SAMPLE_COUNT: usize = 25;
 const SAMPLE_COUNT: usize = 15;
 
+/// Fraction of the reference weight above which we consider the calibration
+/// weight placed. Deliberately generous so that a badly off stored factor
+/// still detects the weight.
+const CALIBRATION_DETECTION_FRACTION: f32 = 0.5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Format)]
+pub enum CalibrationError {
+    /// Calibration can only be started while idle.
+    Busy,
+    /// Calibration was not in progress.
+    NotCalibrating,
+}
+
 enum GrinderState {
     Tare {
         samples: heapless::Vec<f32, CALIBRATION_SAMPLE_COUNT>,
+        /// Reference weight in grams to calibrate against once taring is done.
+        calibration_weight: Option<f32>,
     },
-    WaitingForCalibration {},
+    WaitingForCalibration {
+        calibration_weight: f32,
+    },
     Calibrating {
+        calibration_weight: f32,
         samples: heapless::Vec<f32, CALIBRATION_SAMPLE_COUNT>,
     },
     WaitingForPortafilter {},
@@ -193,18 +211,57 @@ impl GrinderStateMachine {
             },
             state: Some(GrinderState::Tare {
                 samples: heapless::Vec::new(),
+                calibration_weight: None,
             }),
         }
+    }
+
+    /// Starts calibrating against a known `calibration_weight` in grams. The
+    /// scale is re-tared first, so it has to be empty.
+    pub fn start_calibration(&mut self, calibration_weight: f32) -> Result<(), CalibrationError> {
+        match self.state.as_ref().unwrap() {
+            GrinderState::WaitingForPortafilter {} => {
+                info!(
+                    "Starting calibration with {}g reference weight - taring...",
+                    calibration_weight
+                );
+                self.state = Some(GrinderState::Tare {
+                    samples: heapless::Vec::new(),
+                    calibration_weight: Some(calibration_weight),
+                });
+                Ok(())
+            }
+            _ => Err(CalibrationError::Busy),
+        }
+    }
+
+    /// Aborts a calibration started with [`Self::start_calibration`] and keeps
+    /// the previous factor.
+    pub fn cancel_calibration(&mut self) -> Result<(), CalibrationError> {
+        match self.state.as_mut().unwrap() {
+            GrinderState::Tare {
+                calibration_weight: calibration_weight @ Some(_),
+                ..
+            } => {
+                // Let the tare finish, it is still useful.
+                *calibration_weight = None;
+            }
+            GrinderState::WaitingForCalibration { .. } | GrinderState::Calibrating { .. } => {
+                self.state = Some(GrinderState::WaitingForPortafilter {});
+            }
+            _ => return Err(CalibrationError::NotCalibrating),
+        }
+        info!("Calibration cancelled");
+        Ok(())
     }
 
     pub fn as_user_event(&self) -> UserEvent {
         match self.state.as_ref().unwrap() {
             GrinderState::Tare { .. } => UserEvent::Initializing,
 
-            GrinderState::WaitingForPortafilter {} | GrinderState::WaitingForCalibration { .. } => {
-                UserEvent::Idle
-            }
-            GrinderState::Calibrating { .. } => UserEvent::Stabilizing,
+            GrinderState::WaitingForPortafilter {} => UserEvent::Idle,
+            GrinderState::WaitingForCalibration { .. } => UserEvent::WaitingForCalibration,
+            GrinderState::Calibrating { .. } => UserEvent::Calibrating,
             GrinderState::Stabilizing { .. } => UserEvent::Stabilizing,
             GrinderState::Grinding { .. } => UserEvent::Grinding,
             GrinderState::WaitingForRemoval { .. } => UserEvent::WaitingForRemoval,
@@ -229,8 +286,6 @@ impl GrinderStateMachine {
 
     fn update_weight(&mut self, raw_weight: f32) {
         // Minimum weight to detect portafilter placement.
-        const CALIBRATION_WEIGHT: f32 = 200.0;
-        // Minimum weight to detect portafilter placement.
         const PORTAFILTER_THRESHOLD: f32 = 100.0;
         // Weight below which we consider portafilter removed.
         const REMOVAL_THRESHOLD: f32 = 10.0;
@@ -240,7 +295,10 @@ impl GrinderStateMachine {
         let weight = self.scale_setting.translate(raw_weight);
         debug!("weight: {}", weight);
         self.state = Some(match self.state.take().unwrap() {
-            GrinderState::Tare { mut samples } => {
+            GrinderState::Tare {
+                mut samples,
+                calibration_weight,
+            } => {
                 if samples.is_full() {
                     let (new_mean_offset, variance) =
                         compute_mean_variance(&mut samples, 3.0).unwrap_or((0.0, 0.0));
@@ -250,44 +308,78 @@ impl GrinderStateMachine {
                     );
                     self.scale_setting.offset = new_mean_offset;
                     self.scale_setting.inv_variance = 1.0 / variance.max(1.0);
-                    GrinderState::WaitingForPortafilter {}
+                    match calibration_weight {
+                        Some(calibration_weight) => {
+                            info!("Waiting for {}g calibration weight", calibration_weight);
+                            GrinderState::WaitingForCalibration { calibration_weight }
+                        }
+                        None => GrinderState::WaitingForPortafilter {},
+                    }
                 } else {
                     samples.push(raw_weight).unwrap();
-                    GrinderState::Tare { samples }
+                    GrinderState::Tare {
+                        samples,
+                        calibration_weight,
+                    }
                 }
             }
 
-            GrinderState::WaitingForCalibration {} => {
-                if weight > CALIBRATION_WEIGHT * 0.8 {
+            GrinderState::WaitingForCalibration { calibration_weight } => {
+                if weight > calibration_weight * CALIBRATION_DETECTION_FRACTION {
                     info!(
                         "Known weight detected: {}g - starting calibration...",
                         weight
                     );
                     GrinderState::Calibrating {
-                        samples: heapless::Vec::new(),
+                        calibration_weight,
+                        samples: heapless::Vec::from_slice(&[weight]).unwrap(),
                     }
                 } else {
-                    GrinderState::WaitingForCalibration {}
+                    GrinderState::WaitingForCalibration { calibration_weight }
                 }
             }
 
-            GrinderState::Calibrating { mut samples } => {
-                if samples.is_full() {
-                    let (new_mean_weight, _variance) = compute_mean_variance(&mut samples, 3.0)
-                        .unwrap_or((CALIBRATION_WEIGHT, 0.0));
-                    let factor = CALIBRATION_WEIGHT / new_mean_weight;
-                    info!(
-                        "Calibration complete. Offset: {}g,  Factor: {}",
-                        new_mean_weight, factor
+            GrinderState::Calibrating {
+                calibration_weight,
+                mut samples,
+            } => {
+                samples.push(weight).unwrap();
+
+                let (mean_weight, _) =
+                    compute_mean_variance(&mut samples, 3.0).unwrap_or((weight, 0.0));
+
+                let threshold = f32::math::sqrt(
+                    1.0 / self.scale_setting.inv_variance * self.scale_setting.factor.powi(2),
+                ) * 3.0;
+
+                if weight < calibration_weight * CALIBRATION_DETECTION_FRACTION {
+                    info!("Calibration weight removed during calibration - waiting for placement");
+                    GrinderState::WaitingForCalibration { calibration_weight }
+                } else if samples.len() > 5 && (weight - mean_weight).abs() > threshold {
+                    warn!(
+                        "Weight unstable during calibration (weight: {}g, mean: {}g, threshold: {}g) - restarting",
+                        weight, mean_weight, threshold
                     );
+                    GrinderState::Calibrating {
+                        calibration_weight,
+                        samples: heapless::Vec::from_slice(&[weight]).unwrap(),
+                    }
+                } else if samples.is_full() {
+                    let factor = calibration_weight / mean_weight;
                     self.scale_setting.factor *= factor;
+                    info!(
+                        "Calibration complete. Measured: {}g, correction: {}, new factor: {}",
+                        mean_weight, factor, self.scale_setting.factor
+                    );
                     storage::write_calibration_factor(&mut self.flash, self.scale_setting.factor);
                     GrinderState::WaitingForRemoval {
                         portafilter_weight: 0.0,
                     }
                 } else {
-                    samples.push(weight).unwrap();
-                    GrinderState::Calibrating { samples }
+                    GrinderState::Calibrating {
+                        calibration_weight,
+                        samples,
+                    }
                 }
             }
 

@@ -4,11 +4,13 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, mutex,
 use embassy_time::{Duration, Instant};
 use picoserve::futures::Either;
 use picoserve::response::ws;
-use picoserve::routing::{get, get_service};
+use picoserve::extract::Form;
+use picoserve::response::StatusCode;
+use picoserve::routing::{get, get_service, post};
 use picoserve::{make_static, AppBuilder, AppRouter};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::scale::{GrinderStateMachine, ScaleSetting, WeightReading, WEIGHT_BATCH_CHANNEL_SIZE};
+use crate::scale::{CalibrationError, GrinderStateMachine, ScaleSetting, WeightReading, WEIGHT_BATCH_CHANNEL_SIZE};
 use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
 
 pub const WEB_TASK_POOL_SIZE: usize = 8;
@@ -23,6 +25,7 @@ enum WsMessage {
     },
     StateChange {
         state: UserEvent,
+        scale_setting: ScaleSetting,
         timestamp_ms: u64,
     },
     WeightBatch {
@@ -176,6 +179,22 @@ impl ws::WebSocketCallback for GrinderWebSocket {
     }
 }
 
+#[derive(Deserialize)]
+struct CalibrateForm {
+    weight: f32,
+}
+
+/// Largest reference weight we accept for calibration in grams.
+const MAX_CALIBRATION_WEIGHT: f32 = 5000.0;
+
+fn calibration_response(result: Result<(), CalibrationError>) -> (StatusCode, &'static str) {
+    match result {
+        Ok(()) => (StatusCode::OK, "OK"),
+        Err(CalibrationError::Busy) => (StatusCode::CONFLICT, "Grinder is busy"),
+        Err(CalibrationError::NotCalibrating) => (StatusCode::CONFLICT, "Not calibrating"),
+    }
+}
+
 struct AppProps {
     grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
     ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
@@ -199,6 +218,26 @@ impl AppBuilder for AppProps {
                 get_service(picoserve::response::File::javascript(include_str!(
                     "index.js"
                 ))),
+            )
+            .route(
+                "/calibrate",
+                post(move |Form(CalibrateForm { weight })| async move {
+                    if !(weight > 0.0 && weight <= MAX_CALIBRATION_WEIGHT) {
+                        return (StatusCode::BAD_REQUEST, "Invalid calibration weight");
+                    }
+                    let result = grinder_state_machine
+                        .lock()
+                        .await
+                        .start_calibration(weight);
+                    calibration_response(result)
+                }),
+            )
+            .route(
+                "/calibrate/cancel",
+                post(move || async move {
+                    let result = grinder_state_machine.lock().await.cancel_calibration();
+                    calibration_response(result)
+                }),
             )
             .route(
                 "/ws",
@@ -273,6 +312,7 @@ pub async fn websocket_broadcaster_task(
         WEIGHT_BATCH_CHANNEL_SIZE,
     >,
     ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
+    grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
 ) {
     let mut state_initial = state_receiver.get().await;
     loop {
@@ -282,8 +322,14 @@ pub async fn websocket_broadcaster_task(
                 let new_state = state_receiver
                     .changed_and(|&state| state != state_initial)
                     .await;
+                let scale_setting = grinder_state_machine
+                    .lock()
+                    .await
+                    .get_scale_setting()
+                    .clone();
                 let msg = WsMessage::StateChange {
                     state: new_state,
+                    scale_setting,
                     timestamp_ms: Instant::now().as_millis(),
                 };
                 let registry = ws_registry.lock().await;

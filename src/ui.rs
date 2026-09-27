@@ -19,6 +19,8 @@ pub enum UserEvent {
     Stabilizing,
     Grinding,
     WaitingForRemoval,
+    WaitingForCalibration,
+    Calibrating,
 }
 
 // Generates rainbow colors across 0-255 positions.
@@ -105,7 +107,13 @@ pub async fn wifi_task(
                 control.gpio_set(0, false).await;
                 Timer::after(Duration::from_millis(1000)).await;
             }
-            UserEvent::Stabilizing => {
+            UserEvent::WaitingForCalibration => {
+                control.gpio_set(0, true).await;
+                Timer::after(Duration::from_millis(250)).await;
+                control.gpio_set(0, false).await;
+                Timer::after(Duration::from_millis(750)).await;
+            }
+            UserEvent::Stabilizing | UserEvent::Calibrating => {
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(250)).await;
                 control.gpio_set(0, false).await;
@@ -170,13 +178,16 @@ async fn show_grinding_led_strip(ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LE
     future::pending().await
 }
 
-async fn show_waiting_for_removal_led_strip(ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LEDS>) {
+async fn show_pulsing_led_strip(
+    ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LEDS>,
+    color: impl Fn(u8) -> RGB8,
+) {
     let mut data = [RGB8::default(); NUM_LEDS];
     loop {
         for j in 0..(256 * 2) {
             let brightness = if j < 256 { j as u8 } else { (511 - j) as u8 };
             for i in 0..NUM_LEDS {
-                data[i] = (0, brightness, 0).into();
+                data[i] = color(brightness);
             }
             ws2812.write(&data).await;
             Timer::after(Duration::from_millis(10)).await;
@@ -193,7 +204,13 @@ async fn show_state_led_strip(
         UserEvent::Idle => show_idle_led_strip(ws2812).await,
         UserEvent::Stabilizing => show_stabilizing_led_strip(ws2812).await,
         UserEvent::Grinding => show_grinding_led_strip(ws2812).await,
-        UserEvent::WaitingForRemoval => show_waiting_for_removal_led_strip(ws2812).await,
+        UserEvent::WaitingForRemoval => {
+            show_pulsing_led_strip(ws2812, |brightness| (0, brightness, 0).into()).await
+        }
+        UserEvent::WaitingForCalibration => {
+            show_pulsing_led_strip(ws2812, |brightness| (0, 0, brightness).into()).await
+        }
+        UserEvent::Calibrating => show_stabilizing_led_strip(ws2812).await,
     }
 }
 

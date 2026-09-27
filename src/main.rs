@@ -176,6 +176,7 @@ async fn main(spawner: Spawner) {
         unwrap!(STATE_WATCH.receiver()),
         WEIGHT_BATCH_CHANNEL.receiver(),
         ws_registry,
+        grinder_state_machine,
     ));
 
     spawner.must_spawn(network_setup_task(

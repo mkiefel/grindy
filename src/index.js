@@ -33,10 +33,12 @@ class PostcardDecoder {
     return readFn.call(this);
   }
 
-  // Decode UserEvent enum (varint tag: 0=Initializing, 1=Idle, 2=Stabilizing, 3=Grinding, 4=WaitingForRemoval)
+  // Decode UserEvent enum (varint tag: 0=Initializing, 1=Idle, 2=Stabilizing, 3=Grinding,
+  // 4=WaitingForRemoval, 5=WaitingForCalibration, 6=Calibrating)
   readUserEvent() {
     const variant = this.readVarint();
-    const states = ['Initializing', 'Idle', 'Stabilizing', 'Grinding', 'WaitingForRemoval'];
+    const states = ['Initializing', 'Idle', 'Stabilizing', 'Grinding', 'WaitingForRemoval',
+      'WaitingForCalibration', 'Calibrating'];
     return states[variant] || 'Idle';
   }
 
@@ -84,6 +86,7 @@ class PostcardDecoder {
         return {
           type: 'stateChange',
           state: this.readUserEvent(),
+          scaleSetting: this.readScaleSetting(),
           timestampMs: this.readVarint()
         };
       case 2: // WeightBatch
@@ -109,8 +112,91 @@ const statusMap = {
   'Idle': 'idle',
   'Stabilizing': 'stabilizing',
   'Grinding': 'grinding',
-  'WaitingForRemoval': 'waiting'
+  'WaitingForRemoval': 'waiting',
+  'WaitingForCalibration': 'calibration',
+  'Calibrating': 'calibration'
 };
+
+const displayNames = {
+  'WaitingForRemoval': 'Waiting for Removal',
+  'WaitingForCalibration': 'Waiting for Calibration Weight',
+  'Calibrating': 'Calibrating'
+};
+
+// Whether a calibration was started from this page, so we can guide the user
+// through taring and weight removal which share states with normal operation.
+let calibrationActive = false;
+
+function storageGet(key) {
+  try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+
+function storageSet(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) { }
+}
+
+function calibrationWeight() {
+  return parseFloat(document.getElementById('cal-weight').value);
+}
+
+function updateCalibrationUI(status) {
+  const inCalibration = status === 'WaitingForCalibration' || status === 'Calibrating';
+  if (inCalibration) calibrationActive = true;
+  if (status === 'Idle') calibrationActive = false;
+
+  const weight = calibrationWeight();
+  let instructions = '';
+  if (calibrationActive) {
+    switch (status) {
+      case 'Initializing': instructions = 'Taring - keep the scale empty...'; break;
+      case 'WaitingForCalibration': instructions = `Place the ${weight} g reference weight on the scale.`; break;
+      case 'Calibrating': instructions = 'Measuring - keep the scale still...'; break;
+      case 'WaitingForRemoval': instructions = 'Calibration saved. Remove the weight.'; break;
+    }
+  }
+  document.getElementById('cal-instructions').textContent = instructions;
+  document.getElementById('cal-start').disabled = status !== 'Idle' || !(weight > 0);
+  document.getElementById('cal-cancel').hidden =
+    !(inCalibration || (calibrationActive && status === 'Initializing'));
+}
+
+async function postCalibration(path, body) {
+  try {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      addLog(`Calibration request failed: ${text}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    addLog(`Calibration request failed: ${e}`);
+    return false;
+  }
+}
+
+async function startCalibration() {
+  const weight = calibrationWeight();
+  if (!(weight > 0)) return;
+  storageSet('calibrationWeight', String(weight));
+  if (await postCalibration('/calibrate', new URLSearchParams({ weight }).toString())) {
+    calibrationActive = true;
+    addLog(`Calibration started with ${weight} g`);
+    updateCalibrationUI(lastStatus);
+  }
+}
+
+async function cancelCalibration() {
+  if (await postCalibration('/calibrate/cancel', '')) {
+    calibrationActive = false;
+    addLog('Calibration cancelled');
+    updateCalibrationUI(lastStatus);
+  }
+}
 
 function addLog(msg) {
   const logs = document.getElementById('logs');
@@ -127,7 +213,7 @@ function updateUI(status, weight = null, progress = null, scaleSetting = null) {
   const statusContainer = document.getElementById('status-container');
 
   // Update status
-  const displayStatus = status === 'WaitingForRemoval' ? 'Waiting for Removal' : status;
+  const displayStatus = displayNames[status] || status;
   statusText.textContent = displayStatus;
 
   // Update CSS class
@@ -157,6 +243,7 @@ function updateUI(status, weight = null, progress = null, scaleSetting = null) {
   if (lastStatus !== status) {
     addLog(`Status changed to: ${displayStatus}`);
     lastStatus = status;
+    updateCalibrationUI(status);
   }
 }
 
@@ -198,7 +285,7 @@ function handleMessage(arrayBuffer) {
 
       case 'stateChange':
         addLog(`State: ${msg.state}`);
-        updateUI(msg.state);
+        updateUI(msg.state, null, null, msg.scaleSetting);
         break;
 
       case 'weightBatch':
@@ -256,5 +343,10 @@ function connectWebSocket() {
   };
 }
 
-// Initialize WebSocket connection on page load
+// Initialize calibration controls and WebSocket connection on page load
+const savedCalibrationWeight = storageGet('calibrationWeight');
+if (savedCalibrationWeight) document.getElementById('cal-weight').value = savedCalibrationWeight;
+document.getElementById('cal-weight').addEventListener('input', () => updateCalibrationUI(lastStatus));
+document.getElementById('cal-start').addEventListener('click', startCalibration);
+document.getElementById('cal-cancel').addEventListener('click', cancelCalibration);
 connectWebSocket();

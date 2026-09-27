@@ -20,6 +20,14 @@ h1{font-size:2.5rem;margin-bottom:0.5rem;text-align:center;text-shadow:2px 2px 4
 .stabilizing .status-dot{background:#fbbf24}
 .grinding .status-dot{background:#f97316}
 .waiting .status-dot{background:#60a5fa}
+.calibration .status-dot{background:#a78bfa}
+.cal-row{display:flex;flex-wrap:wrap;gap:0.75rem;align-items:center}
+.cal-row label{opacity:0.8}
+.cal-row input{width:7rem;padding:0.5rem;border-radius:0.5rem;border:1px solid rgba(255,255,255,0.3);background:rgba(0,0,0,0.2);color:#fff;font-size:1rem}
+button{padding:0.5rem 1rem;border-radius:0.5rem;border:none;font-size:1rem;font-weight:600;cursor:pointer;background:#fff;color:#1e3c72}
+button.secondary{background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.5)}
+button:disabled{opacity:0.4;cursor:not-allowed}
+#cal-instructions{margin-top:1rem;min-height:1.5em}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin:1rem 0}
 .metric{text-align:center}
 .metric-value{font-size:2rem;font-weight:700;margin:0.5rem 0}
@@ -76,6 +84,17 @@ h1{font-size:2.5rem;margin-bottom:0.5rem;text-align:center;text-shadow:2px 2px 4
 <div class="metric-label">grams</div>
 </div>
 </div>
+</div>
+
+<div class="card">
+<h2 style="margin-bottom:1rem">Calibration</h2>
+<div class="cal-row">
+<label for="cal-weight">Reference weight</label>
+<input type="number" id="cal-weight" min="1" max="5000" step="0.1" value="200"> g
+<button id="cal-start" disabled>Start calibration</button>
+<button id="cal-cancel" class="secondary" hidden>Cancel</button>
+</div>
+<p id="cal-instructions"></p>
 </div>
 
 <div class="card">
