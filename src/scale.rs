@@ -1,4 +1,4 @@
-use core::f32;
+use core::f32::math;
 use defmt::*;
 use embassy_rp::gpio::{Input, Output};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, mutex, watch};
@@ -350,7 +350,7 @@ impl GrinderStateMachine {
                 let (mean_weight, _) =
                     compute_mean_variance(&mut samples, 3.0).unwrap_or((weight, 0.0));
 
-                let threshold = f32::math::sqrt(
+                let threshold = math::sqrt(
                     1.0 / self.scale_setting.inv_variance * self.scale_setting.factor.powi(2),
                 ) * 3.0;
 
@@ -406,7 +406,7 @@ impl GrinderStateMachine {
                 let (portafilter_weight, _) =
                     compute_mean_variance(&mut samples, 3.0).unwrap_or((weight, 0.0));
 
-                let threshold = f32::math::sqrt(
+                let threshold = math::sqrt(
                     1.0 / self.scale_setting.inv_variance * self.scale_setting.factor.powi(2),
                 ) * 3.0;
 
