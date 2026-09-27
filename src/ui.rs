@@ -146,13 +146,34 @@ async fn show_stabilizing_led_strip(ws2812: &mut PioWs2812<'static, PIO1, 0, NUM
     future::pending().await
 }
 
-/// Fills the strip with green proportional to `progress` (0.0 to 1.0). The
-/// LED at the edge of the bar is lit partially so the bar grows smoothly.
-fn progress_bar(progress: f32) -> [RGB8; NUM_LEDS] {
-    let lit = progress.clamp(0.0, 1.0) * NUM_LEDS as f32;
+/// How far (in LEDs) the progress has to fall below an LED's switch-on point
+/// before it is switched off again. Keeps scale noise from making the edge of
+/// the bar flicker.
+const PROGRESS_HYSTERESIS: f32 = 0.25;
+
+/// Returns the number of LEDs to light for `progress` (0.0 to 1.0), given that
+/// `lit` LEDs are currently on. LED `n` (1-based) switches on once the progress
+/// reaches `n / NUM_LEDS`, and only switches off again once it drops below that
+/// by more than `PROGRESS_HYSTERESIS`.
+fn lit_leds(progress: f32, mut lit: usize) -> usize {
+    let level = progress.clamp(0.0, 1.0) * NUM_LEDS as f32;
+    while lit < NUM_LEDS && level >= (lit + 1) as f32 {
+        lit += 1;
+    }
+    while lit > 0 && level < lit as f32 - PROGRESS_HYSTERESIS {
+        lit -= 1;
+    }
+    lit
+}
+
+/// Lights the first `lit` LEDs of the strip green.
+fn progress_bar(lit: usize) -> [RGB8; NUM_LEDS] {
     core::array::from_fn(|i| {
-        let fill = (lit - i as f32).clamp(0.0, 1.0);
-        RGB8::new(0, (fill * 255.0) as u8, 0)
+        if i < lit {
+            RGB8::new(0, 255, 0)
+        } else {
+            RGB8::default()
+        }
     })
 }
 
@@ -160,10 +181,15 @@ async fn show_grinding_led_strip(
     ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LEDS>,
     progress_receiver: &mut GrindProgressReceiver,
 ) {
-    write_led_strip(ws2812, &[RGB8::default(); NUM_LEDS]).await;
+    let mut lit = 0;
+    write_led_strip(ws2812, &progress_bar(lit)).await;
     loop {
         let progress = progress_receiver.changed().await;
-        write_led_strip(ws2812, &progress_bar(progress)).await;
+        let new_lit = lit_leds(progress, lit);
+        if new_lit != lit {
+            lit = new_lit;
+            write_led_strip(ws2812, &progress_bar(lit)).await;
+        }
     }
 }
 
