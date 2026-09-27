@@ -77,9 +77,15 @@ State transitions are driven by weight readings from the scale channel.
 
 ### Network Configuration
 
-- Static IP: 192.168.22.1/24 (AP mode)
-- WiFi AP: SSID "grindy", password "grindyrockz", channel 8
-- HTTP endpoint: `GET /` returns current status text
+See `src/wifi.rs`. WiFi credentials are stored in flash (sector after the
+calibration sector, see `src/storage.rs`) and set via `POST /wifi` from the web page.
+
+- On boot, joins the stored network using DHCP.
+- If nothing is stored or joining fails: opens the setup AP "grindy" (password
+  "grindyrockz", channel 8) with static IP 192.168.25.1/24 (no DHCP server;
+  clients need a static IP in 192.168.25.0/24).
+- Saving new credentials stores them and makes `network_task` reconnect.
+- `GET /wifi` returns the current mode and SSID as JSON.
 
 ### Hardware Pins
 

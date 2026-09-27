@@ -198,6 +198,57 @@ async function cancelCalibration() {
   }
 }
 
+async function loadWifiStatus() {
+  try {
+    const response = await fetch('/wifi');
+    const status = await response.json();
+    let text;
+    switch (status.mode) {
+      case 'client': text = `Connected to ${status.ssid}.`; break;
+      case 'setup':
+        text = status.ssid
+          ? `Could not connect to ${status.ssid}. Running the "grindy" setup access point.`
+          : 'No network configured. Running the "grindy" setup access point.';
+        break;
+      default: text = status.ssid ? `Connecting to ${status.ssid}...` : 'Connecting...';
+    }
+    document.getElementById('wifi-status').textContent = text;
+    const ssidInput = document.getElementById('wifi-ssid');
+    if (status.ssid && !ssidInput.value) ssidInput.value = status.ssid;
+  } catch (e) {
+    document.getElementById('wifi-status').textContent = 'WiFi status unavailable';
+  }
+}
+
+async function saveWifi(event) {
+  event.preventDefault();
+  const ssid = document.getElementById('wifi-ssid').value;
+  const password = document.getElementById('wifi-password').value;
+  const instructions = document.getElementById('wifi-instructions');
+  if (password.length > 0 && password.length < 8) {
+    instructions.textContent = 'The password must be empty or at least 8 characters.';
+    return;
+  }
+  try {
+    const response = await fetch('/wifi', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ssid, password }).toString(),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      instructions.textContent = `Saving WiFi settings failed: ${text}`;
+      return;
+    }
+    instructions.textContent = `Saved. Grindy is now connecting to ${ssid}. Join that network and ` +
+      'open Grindy at its new address. If connecting fails, the "grindy" setup access point ' +
+      'comes back at 192.168.25.1.';
+    addLog(`WiFi settings saved for ${ssid}`);
+  } catch (e) {
+    instructions.textContent = `Saving WiFi settings failed: ${e}`;
+  }
+}
+
 function addLog(msg) {
   const logs = document.getElementById('logs');
   const entry = document.createElement('div');
@@ -349,4 +400,6 @@ if (savedCalibrationWeight) document.getElementById('cal-weight').value = savedC
 document.getElementById('cal-weight').addEventListener('input', () => updateCalibrationUI(lastStatus));
 document.getElementById('cal-start').addEventListener('click', startCalibration);
 document.getElementById('cal-cancel').addEventListener('click', cancelCalibration);
+document.getElementById('wifi-form').addEventListener('submit', saveWifi);
+loadWifiStatus();
 connectWebSocket();

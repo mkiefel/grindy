@@ -1,8 +1,7 @@
 use core::future::{self};
 
-use cyw43::{Control, JoinOptions};
+use cyw43::Control;
 use defmt::*;
-use embassy_net::Stack;
 use embassy_rp::peripherals::PIO1;
 use embassy_rp::pio_programs::ws2812::PioWs2812;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch};
@@ -41,58 +40,17 @@ fn wheel(mut wheel_pos: u8) -> RGB8 {
     (wheel_pos * 3, 255 - wheel_pos * 3, 0).into()
 }
 
-/// Attempts to join the WiFi network and waits for the network stack to come
-/// up. Returns `true` once the stack is up, or `false` if all join attempts
-/// were exhausted.
-pub async fn join_wifi(
+/// Blinks the onboard LED (attached to the WiFi chip) according to the
+/// current state.
+pub async fn blink_status_led(
     control: &mut Control<'static>,
-    stack: Stack<'static>,
-    ssid: &'static str,
-    password: &'static str,
-) -> bool {
-    const MAX_JOIN_ATTEMPTS: u32 = 3;
-    let mut backoff = Duration::from_secs(2);
-    for attempt in 1..=MAX_JOIN_ATTEMPTS {
-        match control
-            .join(ssid, JoinOptions::new(password.as_bytes()))
-            .await
-        {
-            Ok(()) => {
-                info!("WiFi joined on attempt {}", attempt);
-                stack.wait_config_up().await;
-                info!("Network stack is up");
-                return true;
-            }
-            Err(err) => {
-                warn!(
-                    "Join attempt {} failed with status: {}",
-                    attempt, err.status
-                );
-                if attempt < MAX_JOIN_ATTEMPTS {
-                    Timer::after(backoff).await;
-                    backoff *= 2;
-                } else {
-                    warn!(
-                        "Giving up on WiFi after {} attempts; running offline",
-                        MAX_JOIN_ATTEMPTS
-                    );
-                }
-            }
-        }
-    }
-    false
-}
-
-#[embassy_executor::task]
-pub async fn wifi_task(
-    mut control: Control<'static>,
-    mut state_receiver: watch::Receiver<
+    state_receiver: &mut watch::Receiver<
         'static,
         CriticalSectionRawMutex,
         UserEvent,
         USER_EVENT_CHANNEL_SIZE,
     >,
-) {
+) -> ! {
     loop {
         match state_receiver.get().await {
             UserEvent::Initializing => {

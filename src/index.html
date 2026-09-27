@@ -98,6 +98,19 @@ button:disabled{opacity:0.4;cursor:not-allowed}
 </div>
 
 <div class="card">
+<h2 style="margin-bottom:1rem">WiFi</h2>
+<p id="wifi-status" style="margin-bottom:1rem">--</p>
+<form id="wifi-form" class="cal-row">
+<label for="wifi-ssid">Network</label>
+<input type="text" id="wifi-ssid" maxlength="32" required style="width:12rem">
+<label for="wifi-password">Password</label>
+<input type="password" id="wifi-password" maxlength="63" style="width:12rem">
+<button type="submit" id="wifi-save">Connect</button>
+</form>
+<p id="wifi-instructions" style="margin-top:1rem;min-height:1.5em"></p>
+</div>
+
+<div class="card">
 <h2 style="margin-bottom:1rem">Recent Activity</h2>
 <div class="logs" id="logs">
 <div class="log-entry">System started. Waiting for connection...</div>

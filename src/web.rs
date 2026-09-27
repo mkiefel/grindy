@@ -11,7 +11,9 @@ use picoserve::{make_static, AppBuilder, AppRouter};
 use serde::{Deserialize, Serialize};
 
 use crate::scale::{CalibrationError, GrinderStateMachine, ScaleSetting, WeightReading, WEIGHT_BATCH_CHANNEL_SIZE};
+use crate::storage::{self, SharedFlash, WifiConfig};
 use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
+use crate::wifi::{WifiMode, WIFI_CONFIG_CHANGED, WIFI_STATUS};
 
 pub const WEB_TASK_POOL_SIZE: usize = 8;
 
@@ -195,9 +197,35 @@ fn calibration_response(result: Result<(), CalibrationError>) -> (StatusCode, &'
     }
 }
 
+#[derive(Deserialize)]
+struct WifiForm {
+    ssid: heapless::String<{ storage::MAX_SSID_LEN }>,
+    password: heapless::String<{ storage::MAX_PASSWORD_LEN }>,
+}
+
+#[derive(Serialize)]
+struct WifiStatusResponse {
+    mode: &'static str,
+    ssid: Option<heapless::String<{ storage::MAX_SSID_LEN }>>,
+}
+
+async fn wifi_status() -> picoserve::response::Json<WifiStatusResponse> {
+    let status = WIFI_STATUS.lock().await;
+    let mode = match status.mode {
+        WifiMode::Connecting => "connecting",
+        WifiMode::Client => "client",
+        WifiMode::SetupAccessPoint => "setup",
+    };
+    picoserve::response::Json(WifiStatusResponse {
+        mode,
+        ssid: status.ssid.clone(),
+    })
+}
+
 struct AppProps {
     grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
     ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
+    flash: SharedFlash,
 }
 
 impl AppBuilder for AppProps {
@@ -207,6 +235,7 @@ impl AppBuilder for AppProps {
         let Self {
             grinder_state_machine,
             ws_registry,
+            flash,
         } = self;
         picoserve::Router::new()
             .route(
@@ -238,6 +267,27 @@ impl AppBuilder for AppProps {
                     let result = grinder_state_machine.lock().await.cancel_calibration();
                     calibration_response(result)
                 }),
+            )
+            .route(
+                "/wifi",
+                get(wifi_status).post(
+                    move |Form(WifiForm { ssid, password })| async move {
+                        let config = WifiConfig { ssid, password };
+                        if !config.is_valid() {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                "SSID must not be empty and the password must be empty or at least 8 characters",
+                            );
+                        }
+                        if !flash.lock(|flash| {
+                            storage::write_wifi_config(&mut flash.borrow_mut(), &config)
+                        }) {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store WiFi config");
+                        }
+                        WIFI_CONFIG_CHANGED.signal(config);
+                        (StatusCode::OK, "OK")
+                    },
+                ),
             )
             .route(
                 "/ws",
@@ -355,12 +405,14 @@ pub fn bringup_web_server(
     stack: embassy_net::Stack<'static>,
     grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
     ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
+    flash: SharedFlash,
 ) {
     let app = make_static!(
         AppRouter<AppProps>,
         AppProps {
             grinder_state_machine,
             ws_registry,
+            flash,
         }
         .build_app()
     );

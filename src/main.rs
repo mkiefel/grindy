@@ -2,7 +2,9 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type, core_float_math)]
 
-use cyw43::{Control, NetDriver};
+use core::cell::RefCell;
+
+use cyw43::NetDriver;
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
@@ -11,7 +13,10 @@ use embassy_rp::gpio::{self, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, PIO1};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, mutex, watch};
+use embassy_sync::{
+    blocking_mutex::{self, raw::CriticalSectionRawMutex},
+    channel, mutex, watch,
+};
 use gpio::{Input, Level, Output};
 use picoserve::make_static;
 use static_cell::StaticCell;
@@ -22,12 +27,14 @@ mod scale;
 mod storage;
 mod ui;
 mod web;
+mod wifi;
 
 use crate::scale::{
     controller_task, scale_task, GrinderStateMachine, WeightReading, SCALE_CHANNEL_SIZE,
     WEIGHT_BATCH_CHANNEL_SIZE,
 };
-use crate::ui::{join_wifi, led_strip_task, wifi_task, UserEvent, USER_EVENT_CHANNEL_SIZE};
+use crate::storage::{FlashStorage, SharedFlash};
+use crate::ui::{led_strip_task, UserEvent, USER_EVENT_CHANNEL_SIZE};
 use crate::web::{
     bringup_web_server, websocket_broadcaster_task, WsConnectionRegistry, WEB_TASK_POOL_SIZE,
 };
@@ -58,31 +65,6 @@ async fn cyw43_task(
 #[embassy_executor::task]
 pub async fn net_task(mut stack: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     stack.run().await
-}
-
-#[embassy_executor::task]
-async fn network_setup_task(
-    spawner: Spawner,
-    mut control: Control<'static>,
-    stack: embassy_net::Stack<'static>,
-    ssid: &'static str,
-    password: &'static str,
-    state_receiver: watch::Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        UserEvent,
-        USER_EVENT_CHANNEL_SIZE,
-    >,
-    grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
-    ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
-) {
-    let wifi_connected = join_wifi(&mut control, stack, ssid, password).await;
-    if wifi_connected {
-        bringup_web_server(&spawner, stack, grinder_state_machine, ws_registry);
-    } else {
-        warn!("WiFi not connected; skipping web server bringup");
-    }
-    spawner.must_spawn(wifi_task(control, state_receiver));
 }
 
 fn bringup_network_stack(
@@ -158,7 +140,11 @@ async fn main(spawner: Spawner) {
     static GRINDER_STATE_MACHINE: StaticCell<
         mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
     > = StaticCell::new();
-    let flash = storage::FlashStorage::new_blocking(p.FLASH);
+    static FLASH: StaticCell<blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<FlashStorage>>> =
+        StaticCell::new();
+    let flash: SharedFlash = FLASH.init(blocking_mutex::Mutex::new(RefCell::new(
+        FlashStorage::new_blocking(p.FLASH),
+    )));
     let grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine> =
         GRINDER_STATE_MACHINE.init(mutex::Mutex::new(GrinderStateMachine::new(grinder, flash)));
 
@@ -179,16 +165,13 @@ async fn main(spawner: Spawner) {
         grinder_state_machine,
     ));
 
-    spawner.must_spawn(network_setup_task(
-        spawner,
+    spawner.must_spawn(wifi::network_task(
         control,
         stack,
-        env!("GRINDY_WIFI_SSID"),
-        env!("GRINDY_WIFI_PASSWORD"),
+        flash,
         unwrap!(STATE_WATCH.receiver()),
-        grinder_state_machine,
-        ws_registry,
     ));
+    bringup_web_server(&spawner, stack, grinder_state_machine, ws_registry, flash);
 
     info!("Hello, coffee world!");
     controller_task(
