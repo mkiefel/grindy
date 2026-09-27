@@ -51,18 +51,30 @@ class PostcardDecoder {
     };
   }
 
+  // Decode EtaReading struct (seconds until the grinder is expected to stop)
+  readEta() {
+    return { median: this.readF32(), lo: this.readF32(), hi: this.readF32() };
+  }
+
+  // Decode StopReason enum (varint tag: 0=Prediction, 1=RawWeight, 2=Timeout)
+  readStopReason() {
+    return ['Prediction', 'RawWeight', 'Timeout'][this.readVarint()] || 'Unknown';
+  }
+
   // Decode WeightReading struct
   readWeightReading() {
     return {
       timestampMs: this.readVarint(),
       weight: this.readF32(),
       state: this.readUserEvent(),
-      coffeeWeight: this.readOption(this.readF32)
+      coffeeWeight: this.readOption(this.readF32),
+      filteredWeight: this.readOption(this.readF32),
+      eta: this.readOption(this.readEta)
     };
   }
 
   // Decode WsMessage enum (varint tag: 0=Connected, 1=StateChange, 2=Weight,
-  // 3=TargetWeightChanged)
+  // 3=TargetWeightChanged, 4=GrindFinished)
   readWsMessage() {
     const variant = this.readVarint();
     switch (variant) {
@@ -73,6 +85,7 @@ class PostcardDecoder {
           scaleSetting: this.readScaleSetting(),
           targetWeight: this.readF32(),
           timestampMs: this.readVarint(),
+          leadTime: this.readF32()
         };
       case 1: // StateChange
         return {
@@ -80,7 +93,8 @@ class PostcardDecoder {
           state: this.readUserEvent(),
           scaleSetting: this.readScaleSetting(),
           targetWeight: this.readF32(),
-          timestampMs: this.readVarint()
+          timestampMs: this.readVarint(),
+          leadTime: this.readF32()
         };
       case 2: // Weight
         return {
@@ -91,6 +105,15 @@ class PostcardDecoder {
         return {
           type: 'targetWeightChanged',
           targetWeight: this.readF32()
+        };
+      case 4: // GrindFinished
+        return {
+          type: 'grindFinished',
+          stopReason: this.readStopReason(),
+          stopWeight: this.readF32(),
+          settledWeight: this.readOption(this.readF32),
+          leadTimeObserved: this.readOption(this.readF32),
+          leadTime: this.readF32()
         };
       default:
         throw new Error(`Unknown WsMessage variant: ${variant}`);
@@ -337,6 +360,50 @@ function updateUI(status, weight = null, progress = null, scaleSetting = null) {
   }
 }
 
+const stopReasonNames = {
+  Prediction: 'forecast',
+  RawWeight: 'weight reading',
+  Timeout: 'timeout',
+  Unknown: 'unknown reason'
+};
+
+function setLeadTime(leadTime) {
+  document.getElementById('lead-time').textContent = leadTime.toFixed(2);
+}
+
+function updateEta(eta) {
+  const value = document.getElementById('eta');
+  const range = document.getElementById('eta-range');
+  if (eta === null) {
+    value.textContent = '--';
+    range.textContent = 'seconds';
+    return;
+  }
+  value.textContent = eta.median.toFixed(1);
+  range.textContent = `seconds (${eta.lo.toFixed(1)}–${eta.hi.toFixed(1)})`;
+}
+
+function grindFinishedSummary(msg) {
+  const target = targetWeight || 18.0;
+  const settled = msg.settledWeight === null
+    ? 'weight did not settle'
+    : `settled at ${msg.settledWeight.toFixed(2)} g (target ${target.toFixed(1)} g)`;
+  const learned = msg.leadTimeObserved === null
+    ? `lead time stays ${msg.leadTime.toFixed(2)} s`
+    : `lead time ${msg.leadTimeObserved.toFixed(2)} s observed, now ${msg.leadTime.toFixed(2)} s`;
+  return `Stopped by ${stopReasonNames[msg.stopReason]} at ${msg.stopWeight.toFixed(2)} g, ` +
+    `${settled}, ${learned}`;
+}
+
+function handleGrindFinished(msg) {
+  setLeadTime(msg.leadTime);
+  addLog(grindFinishedSummary(msg));
+  if (grindTrace) {
+    grindTrace.finished = msg;
+    drawGrindChart();
+  }
+}
+
 // Coffee weight over time for the current (or last) grind, plotted in the Grind Progress card.
 const CHART = { left: 40, right: 590, top: 10, bottom: 215 };
 const CHART_MIN_POINT_INTERVAL_MS = 50;
@@ -367,7 +434,7 @@ function recordGrindReading(reading) {
     return false;
   }
   if (reading.state === 'Grinding' && !(grindTrace && grindTrace.active)) {
-    grindTrace = { startMs: reading.timestampMs, endMs: null, points: [], active: true };
+    grindTrace = { startMs: reading.timestampMs, endMs: null, points: [], active: true, finished: null };
   }
   if (!grindTrace || !grindTrace.active) return false;
 
@@ -429,6 +496,8 @@ function drawGrindChart() {
   const summary = document.getElementById('chart-summary');
   if (grindTrace.endMs === null) {
     summary.textContent = `Grinding... ${lastPoint.weight.toFixed(1)} g after ${duration.toFixed(1)} s`;
+  } else if (grindTrace.finished) {
+    summary.textContent = grindFinishedSummary(grindTrace.finished);
   } else {
     const grindTime = (grindTrace.endMs - grindTrace.startMs) / 1000;
     summary.textContent = `Last grind: ${lastPoint.weight.toFixed(1)} g in ${grindTime.toFixed(1)} s`;
@@ -444,8 +513,8 @@ function handleWeight(reading) {
 
   // Use coffee weight if available (during grinding)
   if (reading.coffeeWeight !== undefined && reading.coffeeWeight !== null) {
-    displayWeight = reading.coffeeWeight;
-    progress = Math.min(100, Math.round((reading.coffeeWeight / TARGET_WEIGHT) * 100));
+    displayWeight = reading.filteredWeight ?? reading.coffeeWeight;
+    progress = Math.min(100, Math.round((displayWeight / TARGET_WEIGHT) * 100));
   } else if (reading.state === 'Grinding') {
     // Fallback: assume total weight includes ~100g portafilter
     const estimatedCoffeeWeight = Math.max(0, reading.weight - 100);
@@ -453,6 +522,7 @@ function handleWeight(reading) {
     progress = Math.min(100, Math.round((estimatedCoffeeWeight / TARGET_WEIGHT) * 100));
   }
 
+  updateEta(reading.eta);
   updateUI(reading.state, displayWeight, progress);
 }
 
@@ -465,12 +535,14 @@ function handleMessage(arrayBuffer) {
       case 'connected':
         addLog('Connected to Grindy');
         setTargetWeight(msg.targetWeight);
+        setLeadTime(msg.leadTime);
         updateUI(msg.state, null, null, msg.scaleSetting);
         break;
 
       case 'stateChange':
         addLog(`State: ${msg.state}`);
         setTargetWeight(msg.targetWeight);
+        setLeadTime(msg.leadTime);
         updateUI(msg.state, null, null, msg.scaleSetting);
         break;
 
@@ -480,6 +552,10 @@ function handleMessage(arrayBuffer) {
 
       case 'weight':
         handleWeight(msg.reading);
+        break;
+
+      case 'grindFinished':
+        handleGrindFinished(msg);
         break;
 
       default:
