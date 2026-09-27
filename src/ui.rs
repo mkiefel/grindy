@@ -10,6 +10,12 @@ use serde::Serialize;
 use smart_leds::RGB8;
 
 pub const USER_EVENT_CHANNEL_SIZE: usize = 3;
+pub const GRIND_PROGRESS_CHANNEL_SIZE: usize = 1;
+
+/// Receives the grind progress from 0.0 (nothing ground) to 1.0 (target
+/// weight reached) while grinding.
+pub type GrindProgressReceiver =
+    watch::Receiver<'static, CriticalSectionRawMutex, f32, GRIND_PROGRESS_CHANNEL_SIZE>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub enum UserEvent {
@@ -140,13 +146,25 @@ async fn show_stabilizing_led_strip(ws2812: &mut PioWs2812<'static, PIO1, 0, NUM
     future::pending().await
 }
 
-async fn show_grinding_led_strip(ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LEDS>) {
-    let mut data = [RGB8::default(); NUM_LEDS];
-    for i in 0..NUM_LEDS {
-        data[i] = RGB8::new(0, 255, 0);
+/// Fills the strip with green proportional to `progress` (0.0 to 1.0). The
+/// LED at the edge of the bar is lit partially so the bar grows smoothly.
+fn progress_bar(progress: f32) -> [RGB8; NUM_LEDS] {
+    let lit = progress.clamp(0.0, 1.0) * NUM_LEDS as f32;
+    core::array::from_fn(|i| {
+        let fill = (lit - i as f32).clamp(0.0, 1.0);
+        RGB8::new(0, (fill * 255.0) as u8, 0)
+    })
+}
+
+async fn show_grinding_led_strip(
+    ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LEDS>,
+    progress_receiver: &mut GrindProgressReceiver,
+) {
+    write_led_strip(ws2812, &[RGB8::default(); NUM_LEDS]).await;
+    loop {
+        let progress = progress_receiver.changed().await;
+        write_led_strip(ws2812, &progress_bar(progress)).await;
     }
-    write_led_strip(ws2812, &data).await;
-    future::pending().await
 }
 
 async fn show_pulsing_led_strip(
@@ -168,13 +186,14 @@ async fn show_pulsing_led_strip(
 
 async fn show_state_led_strip(
     ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LEDS>,
+    progress_receiver: &mut GrindProgressReceiver,
     state: UserEvent,
 ) {
     match state {
         UserEvent::Initializing => show_initializing_led_strip(ws2812).await,
         UserEvent::Idle => show_idle_led_strip(ws2812).await,
         UserEvent::Stabilizing => show_stabilizing_led_strip(ws2812).await,
-        UserEvent::Grinding => show_grinding_led_strip(ws2812).await,
+        UserEvent::Grinding => show_grinding_led_strip(ws2812, progress_receiver).await,
         UserEvent::WaitingForRemoval => {
             show_pulsing_led_strip(ws2812, |brightness| (0, brightness, 0).into()).await
         }
@@ -194,13 +213,14 @@ pub async fn led_strip_task(
         UserEvent,
         USER_EVENT_CHANNEL_SIZE,
     >,
+    mut progress_receiver: GrindProgressReceiver,
 ) {
     let mut state = UserEvent::Initializing;
 
     loop {
         let result = embassy_futures::select::select(
             state_receiver.changed(),
-            show_state_led_strip(&mut ws2812, state),
+            show_state_led_strip(&mut ws2812, &mut progress_receiver, state),
         )
         .await;
 

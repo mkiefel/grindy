@@ -34,7 +34,9 @@ use crate::scale::{
     WEIGHT_BATCH_CHANNEL_SIZE,
 };
 use crate::storage::{FlashStorage, SharedFlash};
-use crate::ui::{led_strip_task, UserEvent, USER_EVENT_CHANNEL_SIZE};
+use crate::ui::{
+    led_strip_task, UserEvent, GRIND_PROGRESS_CHANNEL_SIZE, USER_EVENT_CHANNEL_SIZE,
+};
 use crate::web::{
     bringup_web_server, websocket_broadcaster_task, WsConnectionRegistry, WEB_TASK_POOL_SIZE,
 };
@@ -101,7 +103,16 @@ async fn main(spawner: Spawner) {
     static STATE_WATCH: watch::Watch<CriticalSectionRawMutex, UserEvent, USER_EVENT_CHANNEL_SIZE> =
         watch::Watch::new();
     STATE_WATCH.sender().send(UserEvent::Initializing);
-    spawner.must_spawn(led_strip_task(ws2812, unwrap!(STATE_WATCH.receiver())));
+    static GRIND_PROGRESS_WATCH: watch::Watch<
+        CriticalSectionRawMutex,
+        f32,
+        GRIND_PROGRESS_CHANNEL_SIZE,
+    > = watch::Watch::new();
+    spawner.must_spawn(led_strip_task(
+        ws2812,
+        unwrap!(STATE_WATCH.receiver()),
+        unwrap!(GRIND_PROGRESS_WATCH.receiver()),
+    ));
 
     let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
@@ -177,6 +188,7 @@ async fn main(spawner: Spawner) {
     controller_task(
         SCALE_CHANNEL.receiver(),
         STATE_WATCH.sender(),
+        GRIND_PROGRESS_WATCH.sender(),
         WEIGHT_BATCH_CHANNEL.sender(),
         &grinder_state_machine,
     )

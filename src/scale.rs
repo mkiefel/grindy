@@ -8,7 +8,7 @@ use num_traits::float::FloatCore;
 use serde::Serialize;
 
 use crate::storage::{self, SharedFlash};
-use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
+use crate::ui::{UserEvent, GRIND_PROGRESS_CHANNEL_SIZE, USER_EVENT_CHANNEL_SIZE};
 
 pub const WEIGHT_BATCH_CHANNEL_SIZE: usize = 2;
 pub const SCALE_CHANNEL_SIZE: usize = 5;
@@ -527,6 +527,12 @@ pub async fn controller_task(
         UserEvent,
         USER_EVENT_CHANNEL_SIZE,
     >,
+    grind_progress_sender: watch::Sender<
+        'static,
+        CriticalSectionRawMutex,
+        f32,
+        GRIND_PROGRESS_CHANNEL_SIZE,
+    >,
     weight_batch_sender: channel::Sender<
         'static,
         CriticalSectionRawMutex,
@@ -551,7 +557,7 @@ pub async fn controller_task(
             embassy_time::with_timeout(BATCH_INTERVAL, scale_receiver.receive()).await;
 
         if let Ok(raw_weight) = raw_weight_opt {
-            let (event, weight, coffee_weight) = {
+            let (event, weight, coffee_weight, target_weight) = {
                 let mut grinder_state_machine_guard = grinder_state_machine.lock().await;
                 grinder_state_machine_guard.update_weight(raw_weight);
                 let event = grinder_state_machine_guard.as_user_event();
@@ -559,8 +565,14 @@ pub async fn controller_task(
                     .scale_setting
                     .translate(raw_weight);
                 let coffee_weight = grinder_state_machine_guard.get_coffee_weight(weight);
-                (event, weight, coffee_weight)
+                let target_weight = grinder_state_machine_guard.get_target_weight();
+                (event, weight, coffee_weight, target_weight)
             };
+            // Sent before the state so the LED strip never picks up a stale
+            // progress from the previous grind when grinding starts.
+            if let (UserEvent::Grinding, Some(coffee_weight)) = (event, coffee_weight) {
+                grind_progress_sender.send((coffee_weight / target_weight).clamp(0.0, 1.0));
+            }
             if event != last_event {
                 last_event = event;
                 state_sender.send(event);
