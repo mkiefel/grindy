@@ -62,13 +62,14 @@ Data is saved in Parquet format with the following schema:
 |--------|------|-------------|
 | `timestamp_ms` | uint64 | Microcontroller timestamp in milliseconds |
 | `received_at` | float64 | Local Unix timestamp when message was received |
-| `message_type` | string | "Connected", "StateChange", or "WeightReading" |
-| `state` | string | Grinder state: "Idle", "Stabilizing", "Grinding", "WaitingForRemoval" |
+| `message_type` | string | "Connected", "StateChange", "WeightReading", or "TargetWeightChanged" |
+| `state` | string | Grinder state: "Initializing", "Idle", "Stabilizing", "Grinding", "WaitingForRemoval", "WaitingForCalibration", "Calibrating" (null for "TargetWeightChanged") |
 | `weight` | float32 | Total weight on scale (nullable) |
 | `coffee_weight` | float32 | Coffee weight only (nullable) |
 | `scale_offset` | float32 | Scale calibration offset (nullable) |
 | `scale_inv_variance` | float32 | Inverse variance of scale (nullable) |
 | `scale_factor` | float32 | Scale calibration factor (nullable) |
+| `target_weight` | float32 | Target coffee weight in grams (nullable) |
 
 ### Timestamp Ordering
 
@@ -117,11 +118,12 @@ grinding.select([
 
 ## Message Types
 
-The WebSocket sends three types of messages:
+The WebSocket sends four types of messages:
 
-1. **Connected**: Sent immediately on connection with current state and scale calibration
-2. **StateChange**: Sent when grinder state transitions (Idle → Stabilizing → Grinding → WaitingForRemoval)
-3. **WeightBatch**: Sent every ~100ms with up to 4 weight readings
+1. **Connected**: Sent immediately on connection with current state, scale calibration and target weight
+2. **StateChange**: Sent when grinder state transitions (Idle → Stabilizing → Grinding → WaitingForRemoval), with scale calibration and target weight
+3. **Weight**: Sent for every scale sample with one weight reading
+4. **TargetWeightChanged**: Sent when the target weight is changed from the web page. It carries no device timestamp, so its row reuses the latest `timestamp_ms` seen before it
 
 ## Troubleshooting
 

@@ -3,7 +3,7 @@
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable, List, Optional, TypeVar, Union
+from typing import Callable, Optional, TypeVar, Union
 
 T = TypeVar('T')
 
@@ -15,6 +15,8 @@ class UserEvent(IntEnum):
     Stabilizing = 2
     Grinding = 3
     WaitingForRemoval = 4
+    WaitingForCalibration = 5
+    Calibrating = 6
 
 
 @dataclass
@@ -39,6 +41,7 @@ class ConnectedMessage:
     """Initial connection message with current state."""
     state: UserEvent
     scale_setting: ScaleSetting
+    target_weight: float
     timestamp_ms: int
 
 
@@ -46,17 +49,27 @@ class ConnectedMessage:
 class StateChangeMessage:
     """State transition notification."""
     state: UserEvent
+    scale_setting: ScaleSetting
+    target_weight: float
     timestamp_ms: int
 
 
 @dataclass
-class WeightBatchMessage:
-    """Batch of weight readings."""
-    readings: List[WeightReading]
+class WeightMessage:
+    """A single weight reading, sent for every scale sample."""
+    reading: WeightReading
+
+
+@dataclass
+class TargetWeightChangedMessage:
+    """Target coffee weight was changed via the web page."""
+    target_weight: float
 
 
 # Union type for all possible WebSocket messages
-WsMessage = Union[ConnectedMessage, StateChangeMessage, WeightBatchMessage]
+WsMessage = Union[
+    ConnectedMessage, StateChangeMessage, WeightMessage, TargetWeightChangedMessage
+]
 
 class PostcardDecoder:
     def __init__(self, buffer: bytes):
@@ -112,11 +125,6 @@ class PostcardDecoder:
             coffee_weight=self.read_option(self.read_f32)
         )
 
-    def read_vec(self, read_fn: Callable[[], T]) -> List[T]:
-        """Decode Vec<T> - varint length followed by elements."""
-        length = self.read_varint()
-        return [read_fn() for _ in range(length)]
-
     def read_ws_message(self) -> WsMessage:
         """Decode WsMessage enum."""
         variant = self.read_varint()
@@ -125,17 +133,20 @@ class PostcardDecoder:
             return ConnectedMessage(
                 state=self.read_user_event(),
                 scale_setting=self.read_scale_setting(),
+                target_weight=self.read_f32(),
                 timestamp_ms=self.read_varint(),
             )
         elif variant == 1:
             return StateChangeMessage(
                 state=self.read_user_event(),
-                timestamp_ms=self.read_varint()
+                scale_setting=self.read_scale_setting(),
+                target_weight=self.read_f32(),
+                timestamp_ms=self.read_varint(),
             )
         elif variant == 2:
-            return WeightBatchMessage(
-                readings=self.read_vec(self.read_weight_reading)
-            )
+            return WeightMessage(reading=self.read_weight_reading())
+        elif variant == 3:
+            return TargetWeightChangedMessage(target_weight=self.read_f32())
         else:
             raise ValueError(f"Unknown WsMessage variant: {variant}")
 
@@ -147,6 +158,6 @@ def parse_message(data: bytes) -> WsMessage:
         data: Binary postcard-encoded message
 
     Returns:
-        Parsed message (Connected, StateChange, or WeightBatch)
+        Parsed message (Connected, StateChange, Weight, or TargetWeightChanged)
     """
     return PostcardDecoder(data).read_ws_message()
