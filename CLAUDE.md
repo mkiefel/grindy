@@ -115,7 +115,8 @@ Uses `defmt` for efficient embedded logging:
 ## Important Constants
 
 Located in `GrinderStateMachine::update_weight()` (src/main.rs:293-305):
-- `TARGET_COFFEE_WEIGHT`: 18.0g
+- Target coffee weight: 18.0g default (`DEFAULT_TARGET_WEIGHT`), configurable 1-100g via
+  `POST /target-weight` from the web page and stored in flash (sector after the WiFi one)
 - `PORTAFILTER_THRESHOLD`: 100.0g (detection threshold)
 - `REMOVAL_THRESHOLD`: 10.0g
 - `STABILIZATION_TIME`: 2 seconds

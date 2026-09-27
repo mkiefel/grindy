@@ -60,7 +60,7 @@ button:disabled{opacity:0.4;cursor:not-allowed}
 </div>
 <div class="metric">
 <div class="metric-label">Target Weight</div>
-<div class="metric-value">18.0</div>
+<div class="metric-value" id="target-weight">--</div>
 <div class="metric-label">grams</div>
 </div>
 <div class="metric">
@@ -84,6 +84,16 @@ button:disabled{opacity:0.4;cursor:not-allowed}
 <div class="metric-label">grams</div>
 </div>
 </div>
+</div>
+
+<div class="card">
+<h2 style="margin-bottom:1rem">Grind Settings</h2>
+<form id="target-form" class="cal-row">
+<label for="target-input">Target weight</label>
+<input type="number" id="target-input" min="1" max="100" step="0.1" required> g
+<button type="submit" id="target-save">Save</button>
+</form>
+<p id="target-instructions" style="margin-top:1rem;min-height:1.5em"></p>
 </div>
 
 <div class="card">

@@ -71,7 +71,8 @@ class PostcardDecoder {
     return vec;
   }
 
-  // Decode WsMessage enum (varint tag: 0=Connected, 1=StateChange, 2=WeightBatch)
+  // Decode WsMessage enum (varint tag: 0=Connected, 1=StateChange, 2=WeightBatch,
+  // 3=TargetWeightChanged)
   readWsMessage() {
     const variant = this.readVarint();
     switch (variant) {
@@ -80,6 +81,7 @@ class PostcardDecoder {
           type: 'connected',
           state: this.readUserEvent(),
           scaleSetting: this.readScaleSetting(),
+          targetWeight: this.readF32(),
           timestampMs: this.readVarint(),
         };
       case 1: // StateChange
@@ -87,12 +89,18 @@ class PostcardDecoder {
           type: 'stateChange',
           state: this.readUserEvent(),
           scaleSetting: this.readScaleSetting(),
+          targetWeight: this.readF32(),
           timestampMs: this.readVarint()
         };
       case 2: // WeightBatch
         return {
           type: 'weightBatch',
           readings: this.readVec(this.readWeightReading)
+        };
+      case 3: // TargetWeightChanged
+        return {
+          type: 'targetWeightChanged',
+          targetWeight: this.readF32()
         };
       default:
         throw new Error(`Unknown WsMessage variant: ${variant}`);
@@ -103,6 +111,7 @@ class PostcardDecoder {
 let lastStatus = '';
 let currentWeight = 0;
 let currentProgress = 0;
+let targetWeight = null;
 let ws = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 30000; // 30 seconds
@@ -195,6 +204,45 @@ async function cancelCalibration() {
     calibrationActive = false;
     addLog('Calibration cancelled');
     updateCalibrationUI(lastStatus);
+  }
+}
+
+function setTargetWeight(weight) {
+  const changed = targetWeight !== weight;
+  targetWeight = weight;
+  document.getElementById('target-weight').textContent = weight.toFixed(1);
+  // Don't overwrite what the user is currently typing.
+  const input = document.getElementById('target-input');
+  if (document.activeElement !== input && (changed || !input.value)) {
+    input.value = weight.toFixed(1);
+  }
+}
+
+async function saveTargetWeight(event) {
+  event.preventDefault();
+  const weight = parseFloat(document.getElementById('target-input').value);
+  const instructions = document.getElementById('target-instructions');
+  if (!(weight >= 1 && weight <= 100)) {
+    instructions.textContent = 'The target weight must be between 1 and 100 g.';
+    return;
+  }
+  try {
+    const response = await fetch('/target-weight', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ weight }).toString(),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      instructions.textContent = `Saving target weight failed: ${text}`;
+      return;
+    }
+    instructions.textContent = '';
+    document.getElementById('target-input').blur();
+    setTargetWeight(weight);
+    addLog(`Target weight set to ${weight.toFixed(1)} g`);
+  } catch (e) {
+    instructions.textContent = `Saving target weight failed: ${e}`;
   }
 }
 
@@ -303,8 +351,7 @@ function handleWeightBatch(readings) {
     // Use the most recent reading
     const latest = readings[readings.length - 1];
 
-    // Calculate progress if grinding (assuming 18g target)
-    const TARGET_WEIGHT = 18.0;
+    const TARGET_WEIGHT = targetWeight || 18.0;
     let progress = 0;
     let displayWeight = latest.weight;
 
@@ -331,12 +378,18 @@ function handleMessage(arrayBuffer) {
     switch (msg.type) {
       case 'connected':
         addLog('Connected to Grindy');
+        setTargetWeight(msg.targetWeight);
         updateUI(msg.state, null, null, msg.scaleSetting);
         break;
 
       case 'stateChange':
         addLog(`State: ${msg.state}`);
+        setTargetWeight(msg.targetWeight);
         updateUI(msg.state, null, null, msg.scaleSetting);
+        break;
+
+      case 'targetWeightChanged':
+        setTargetWeight(msg.targetWeight);
         break;
 
       case 'weightBatch':
@@ -400,6 +453,7 @@ if (savedCalibrationWeight) document.getElementById('cal-weight').value = savedC
 document.getElementById('cal-weight').addEventListener('input', () => updateCalibrationUI(lastStatus));
 document.getElementById('cal-start').addEventListener('click', startCalibration);
 document.getElementById('cal-cancel').addEventListener('click', cancelCalibration);
+document.getElementById('target-form').addEventListener('submit', saveTargetWeight);
 document.getElementById('wifi-form').addEventListener('submit', saveWifi);
 loadWifiStatus();
 connectWebSocket();

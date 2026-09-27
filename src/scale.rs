@@ -149,8 +149,17 @@ pub struct GrinderStateMachine {
     grinder: Output<'static>,
     flash: SharedFlash,
     scale_setting: ScaleSetting,
+    /// Coffee weight in grams to grind to.
+    target_weight: f32,
     state: Option<GrinderState>,
 }
+
+/// Target coffee weight in grams used until one is stored in flash.
+const DEFAULT_TARGET_WEIGHT: f32 = 18.0;
+
+/// Range of accepted target coffee weights in grams.
+pub const MIN_TARGET_WEIGHT: f32 = 1.0;
+pub const MAX_TARGET_WEIGHT: f32 = 100.0;
 
 /// Factor derived from a manual calibration against a known weight, used
 /// until a calibration is stored in flash.
@@ -170,6 +179,14 @@ pub enum CalibrationError {
     Busy,
     /// Calibration was not in progress.
     NotCalibrating,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Format)]
+pub enum TargetWeightError {
+    /// The weight is outside [`MIN_TARGET_WEIGHT`]..=[`MAX_TARGET_WEIGHT`].
+    OutOfRange,
+    /// Persisting the weight to flash failed.
+    Storage,
 }
 
 enum GrinderState {
@@ -203,9 +220,14 @@ impl GrinderStateMachine {
         let factor = flash
             .lock(|flash| storage::read_calibration_factor(&mut flash.borrow_mut()))
             .unwrap_or(DEFAULT_FACTOR);
+        let target_weight = flash
+            .lock(|flash| storage::read_target_weight(&mut flash.borrow_mut()))
+            .filter(|weight| (MIN_TARGET_WEIGHT..=MAX_TARGET_WEIGHT).contains(weight))
+            .unwrap_or(DEFAULT_TARGET_WEIGHT);
         Self {
             grinder,
             flash,
+            target_weight,
             scale_setting: ScaleSetting {
                 offset: 0.0,
                 inv_variance: 0.0,
@@ -274,6 +296,27 @@ impl GrinderStateMachine {
         &self.scale_setting
     }
 
+    pub fn get_target_weight(&self) -> f32 {
+        self.target_weight
+    }
+
+    /// Sets the coffee weight in grams to grind to and persists it. Takes
+    /// effect immediately, even during a running grind.
+    pub fn set_target_weight(&mut self, weight: f32) -> Result<(), TargetWeightError> {
+        if !(MIN_TARGET_WEIGHT..=MAX_TARGET_WEIGHT).contains(&weight) {
+            return Err(TargetWeightError::OutOfRange);
+        }
+        if !self
+            .flash
+            .lock(|flash| storage::write_target_weight(&mut flash.borrow_mut(), weight))
+        {
+            return Err(TargetWeightError::Storage);
+        }
+        info!("Target weight set to {}g", weight);
+        self.target_weight = weight;
+        Ok(())
+    }
+
     fn get_coffee_weight(&self, current_weight: f32) -> Option<f32> {
         match self.state.as_ref().unwrap() {
             GrinderState::Grinding {
@@ -291,8 +334,6 @@ impl GrinderStateMachine {
         const PORTAFILTER_THRESHOLD: f32 = 100.0;
         // Weight below which we consider portafilter removed.
         const REMOVAL_THRESHOLD: f32 = 10.0;
-        // Target coffee weight in grams.
-        const TARGET_COFFEE_WEIGHT: f32 = 18.0;
 
         let weight = self.scale_setting.translate(raw_weight);
         debug!("weight: {}", weight);
@@ -448,7 +489,7 @@ impl GrinderStateMachine {
                     weight
                 );
 
-                if coffee_weight >= TARGET_COFFEE_WEIGHT
+                if coffee_weight >= self.target_weight
                     || Instant::now() - start_time
                         >= Duration::from_secs(MAX_GRIND_TIME_IN_SECS as u64)
                 {

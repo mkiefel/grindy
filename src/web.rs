@@ -10,7 +10,10 @@ use picoserve::routing::{get, get_service, post};
 use picoserve::{make_static, AppBuilder, AppRouter};
 use serde::{Deserialize, Serialize};
 
-use crate::scale::{CalibrationError, GrinderStateMachine, ScaleSetting, WeightReading, WEIGHT_BATCH_CHANNEL_SIZE};
+use crate::scale::{
+    CalibrationError, GrinderStateMachine, ScaleSetting, TargetWeightError, WeightReading,
+    WEIGHT_BATCH_CHANNEL_SIZE,
+};
 use crate::storage::{self, SharedFlash, WifiConfig};
 use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
 use crate::wifi::{WifiMode, WIFI_CONFIG_CHANGED, WIFI_STATUS};
@@ -23,15 +26,20 @@ enum WsMessage {
     Connected {
         state: UserEvent,
         scale_setting: ScaleSetting,
+        target_weight: f32,
         timestamp_ms: u64,
     },
     StateChange {
         state: UserEvent,
         scale_setting: ScaleSetting,
+        target_weight: f32,
         timestamp_ms: u64,
     },
     WeightBatch {
         readings: heapless::Vec<WeightReading, 4>,
+    },
+    TargetWeightChanged {
+        target_weight: f32,
     },
 }
 
@@ -109,16 +117,18 @@ impl ws::WebSocketCallback for GrinderWebSocket {
         info!("WebSocket client {} connected", conn_id);
 
         // Send initial connected message with current state
-        let (current_state, scale_setting) = {
+        let (current_state, scale_setting, target_weight) = {
             let grinder_state_machine = self.grinder_state_machine.lock().await;
             (
                 grinder_state_machine.as_user_event(),
                 grinder_state_machine.get_scale_setting().clone(),
+                grinder_state_machine.get_target_weight(),
             )
         };
         let connected_msg = WsMessage::Connected {
             state: current_state,
             scale_setting,
+            target_weight,
             timestamp_ms: Instant::now().as_millis(),
         };
 
@@ -198,6 +208,11 @@ fn calibration_response(result: Result<(), CalibrationError>) -> (StatusCode, &'
 }
 
 #[derive(Deserialize)]
+struct TargetWeightForm {
+    weight: f32,
+}
+
+#[derive(Deserialize)]
 struct WifiForm {
     ssid: heapless::String<{ storage::MAX_SSID_LEN }>,
     password: heapless::String<{ storage::MAX_PASSWORD_LEN }>,
@@ -266,6 +281,33 @@ impl AppBuilder for AppProps {
                 post(move || async move {
                     let result = grinder_state_machine.lock().await.cancel_calibration();
                     calibration_response(result)
+                }),
+            )
+            .route(
+                "/target-weight",
+                post(move |Form(TargetWeightForm { weight })| async move {
+                    let result = grinder_state_machine
+                        .lock()
+                        .await
+                        .set_target_weight(weight);
+                    match result {
+                        Ok(()) => {
+                            ws_registry
+                                .lock()
+                                .await
+                                .broadcast(&WsMessage::TargetWeightChanged {
+                                    target_weight: weight,
+                                });
+                            (StatusCode::OK, "OK")
+                        }
+                        Err(TargetWeightError::OutOfRange) => {
+                            (StatusCode::BAD_REQUEST, "Invalid target weight")
+                        }
+                        Err(TargetWeightError::Storage) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to store target weight",
+                        ),
+                    }
                 }),
             )
             .route(
@@ -372,14 +414,17 @@ pub async fn websocket_broadcaster_task(
                 let new_state = state_receiver
                     .changed_and(|&state| state != state_initial)
                     .await;
-                let scale_setting = grinder_state_machine
-                    .lock()
-                    .await
-                    .get_scale_setting()
-                    .clone();
+                let (scale_setting, target_weight) = {
+                    let grinder_state_machine = grinder_state_machine.lock().await;
+                    (
+                        grinder_state_machine.get_scale_setting().clone(),
+                        grinder_state_machine.get_target_weight(),
+                    )
+                };
                 let msg = WsMessage::StateChange {
                     state: new_state,
                     scale_setting,
+                    target_weight,
                     timestamp_ms: Instant::now().as_millis(),
                 };
                 let registry = ws_registry.lock().await;

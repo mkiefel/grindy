@@ -22,6 +22,11 @@ const WIFI_CONFIG_OFFSET: u32 = CALIBRATION_OFFSET + ERASE_SIZE as u32;
 
 const WIFI_MAGIC: u32 = 0x6772_7766; // "grwf"
 
+/// Offset of the target weight sector, right after the WiFi config one.
+const TARGET_WEIGHT_OFFSET: u32 = WIFI_CONFIG_OFFSET + ERASE_SIZE as u32;
+
+const TARGET_WEIGHT_MAGIC: u32 = 0x6772_7477; // "grtw"
+
 pub const MAX_SSID_LEN: usize = 32;
 pub const MAX_PASSWORD_LEN: usize = 63;
 /// WPA2 passphrases have to be at least this long; an empty password means an
@@ -48,44 +53,80 @@ impl WifiConfig {
     }
 }
 
+/// Reads an `f32` stored with [`write_f32`] at `offset`. Returns `None` if
+/// nothing has been stored yet (or the stored data is corrupt).
+fn read_f32(flash: &mut FlashStorage, offset: u32, magic: u32) -> Option<f32> {
+    let mut buf = [0u8; 8];
+    if let Err(err) = flash.blocking_read(offset, &mut buf) {
+        warn!("Failed to read flash at {:#x}: {}", offset, err);
+        return None;
+    }
+
+    if u32::from_le_bytes(buf[0..4].try_into().unwrap()) != magic {
+        return None;
+    }
+    Some(f32::from_le_bytes(buf[4..8].try_into().unwrap()))
+}
+
+/// Persists `value` in the sector at `offset` so it can be recovered with
+/// [`read_f32`]. Returns `false` if writing failed.
+fn write_f32(flash: &mut FlashStorage, offset: u32, magic: u32, value: f32) -> bool {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&magic.to_le_bytes());
+    buf[4..8].copy_from_slice(&value.to_le_bytes());
+
+    if let Err(err) = flash.blocking_erase(offset, offset + ERASE_SIZE as u32) {
+        warn!("Failed to erase flash sector at {:#x}: {}", offset, err);
+        return false;
+    }
+    if let Err(err) = flash.blocking_write(offset, &buf) {
+        warn!("Failed to write flash at {:#x}: {}", offset, err);
+        return false;
+    }
+    true
+}
+
 /// Reads the calibration factor previously stored with
 /// [`write_calibration_factor`]. Returns `None` if nothing has been stored
 /// yet (or the stored data is corrupt).
 pub fn read_calibration_factor(flash: &mut FlashStorage) -> Option<f32> {
-    let mut buf = [0u8; 8];
-    if let Err(err) = flash.blocking_read(CALIBRATION_OFFSET, &mut buf) {
-        warn!("Failed to read calibration factor from flash: {}", err);
-        return None;
+    let factor = read_f32(flash, CALIBRATION_OFFSET, MAGIC);
+    match factor {
+        Some(factor) => info!("Loaded calibration factor {} from flash", factor),
+        None => info!("No calibration factor stored in flash yet"),
     }
-
-    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    if magic != MAGIC {
-        info!("No calibration factor stored in flash yet");
-        return None;
-    }
-
-    let factor = f32::from_le_bytes(buf[4..8].try_into().unwrap());
-    info!("Loaded calibration factor {} from flash", factor);
-    Some(factor)
+    factor
 }
 
 /// Persists `factor` so it can be recovered on the next boot with
 /// [`read_calibration_factor`].
 pub fn write_calibration_factor(flash: &mut FlashStorage, factor: f32) {
-    let mut buf = [0u8; 8];
-    buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    buf[4..8].copy_from_slice(&factor.to_le_bytes());
-
-    if let Err(err) = flash.blocking_erase(CALIBRATION_OFFSET, CALIBRATION_OFFSET + ERASE_SIZE as u32)
-    {
-        warn!("Failed to erase calibration flash sector: {}", err);
-        return;
-    }
-    if let Err(err) = flash.blocking_write(CALIBRATION_OFFSET, &buf) {
-        warn!("Failed to write calibration factor to flash: {}", err);
-    } else {
+    if write_f32(flash, CALIBRATION_OFFSET, MAGIC, factor) {
         info!("Stored calibration factor {} to flash", factor);
     }
+}
+
+/// Reads the target coffee weight previously stored with
+/// [`write_target_weight`]. Returns `None` if nothing has been stored yet (or
+/// the stored data is corrupt).
+pub fn read_target_weight(flash: &mut FlashStorage) -> Option<f32> {
+    let weight = read_f32(flash, TARGET_WEIGHT_OFFSET, TARGET_WEIGHT_MAGIC)
+        .filter(|weight| weight.is_finite());
+    match weight {
+        Some(weight) => info!("Loaded target weight {}g from flash", weight),
+        None => info!("No target weight stored in flash yet"),
+    }
+    weight
+}
+
+/// Persists `weight` so it can be recovered on the next boot with
+/// [`read_target_weight`]. Returns `false` if writing failed.
+pub fn write_target_weight(flash: &mut FlashStorage, weight: f32) -> bool {
+    let ok = write_f32(flash, TARGET_WEIGHT_OFFSET, TARGET_WEIGHT_MAGIC, weight);
+    if ok {
+        info!("Stored target weight {}g to flash", weight);
+    }
+    ok
 }
 
 /// Reads the WiFi configuration previously stored with [`write_wifi_config`].
