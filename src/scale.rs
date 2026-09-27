@@ -503,10 +503,19 @@ impl GrinderStateMachine {
                     self.stored_lead_time = lead_time;
                 }
             }
-            None => info!(
-                "Not learning the lead time from this grind (settled weight {}g)",
-                settled_weight
-            ),
+            None => {
+                // Recompute what the estimator would have said the lead time
+                // was, purely for the log: `observe_lead_time` already threw
+                // this number away if it was out of range.
+                let raw_lead_time = settled_weight.and_then(|weight| settle.estimator.eta(weight));
+                info!(
+                    "Not learning the lead time from this grind (stop reason: {}, {} settle samples, settled weight: {}g, lead time observed: {}s)",
+                    settle.stop_reason,
+                    settle.samples.len(),
+                    settled_weight,
+                    raw_lead_time.map(|eta| eta.median),
+                )
+            }
         }
         settle.finish(settled_weight, lead_time_observed, self.lead_time)
     }
@@ -694,8 +703,8 @@ impl GrinderStateMachine {
                 match stop_reason {
                     Some(stop_reason) => {
                         info!(
-                            "Stopping grinder ({}) at {}g coffee, lead time {}s",
-                            stop_reason, coffee_weight, self.lead_time
+                            "Stopping grinder ({}) at {}g coffee after {}s, lead time {}s",
+                            stop_reason, coffee_weight, t, self.lead_time
                         );
                         self.grinder.set_high();
                         GrinderState::WaitingForRemoval {
