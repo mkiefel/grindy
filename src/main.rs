@@ -19,6 +19,7 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 mod scale;
+mod storage;
 mod ui;
 mod web;
 
@@ -157,8 +158,9 @@ async fn main(spawner: Spawner) {
     static GRINDER_STATE_MACHINE: StaticCell<
         mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
     > = StaticCell::new();
+    let flash = storage::FlashStorage::new_blocking(p.FLASH);
     let grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine> =
-        GRINDER_STATE_MACHINE.init(mutex::Mutex::new(GrinderStateMachine::new(grinder)));
+        GRINDER_STATE_MACHINE.init(mutex::Mutex::new(GrinderStateMachine::new(grinder, flash)));
 
     static WS_REGISTRY: StaticCell<mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>> =
         StaticCell::new();

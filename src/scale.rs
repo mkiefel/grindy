@@ -7,6 +7,7 @@ use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
 use serde::Serialize;
 
+use crate::storage::{self, FlashStorage};
 use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
 
 pub const WEIGHT_BATCH_CHANNEL_SIZE: usize = 2;
@@ -146,9 +147,14 @@ const MAX_GRIND_TIME_IN_SECS: usize = 50;
 
 pub struct GrinderStateMachine {
     grinder: Output<'static>,
+    flash: FlashStorage,
     scale_setting: ScaleSetting,
     state: Option<GrinderState>,
 }
+
+/// Factor derived from a manual calibration against a known weight, used
+/// until a calibration is stored in flash.
+const DEFAULT_FACTOR: f32 = 200.0 / 85314.55 * 0.478242 * 1.049868 / 50.3 * 48.0;
 
 const CALIBRATION_SAMPLE_COUNT: usize = 25;
 const SAMPLE_COUNT: usize = 15;
@@ -175,13 +181,15 @@ enum GrinderState {
 }
 
 impl GrinderStateMachine {
-    pub fn new(grinder: Output<'static>) -> Self {
+    pub fn new(grinder: Output<'static>, mut flash: FlashStorage) -> Self {
+        let factor = storage::read_calibration_factor(&mut flash).unwrap_or(DEFAULT_FACTOR);
         Self {
             grinder,
+            flash,
             scale_setting: ScaleSetting {
                 offset: 0.0,
                 inv_variance: 0.0,
-                factor: 200.0 / 85314.55 * 0.478242 * 1.049868,
+                factor,
             },
             state: Some(GrinderState::Tare {
                 samples: heapless::Vec::new(),
@@ -273,6 +281,7 @@ impl GrinderStateMachine {
                         new_mean_weight, factor
                     );
                     self.scale_setting.factor *= factor;
+                    storage::write_calibration_factor(&mut self.flash, self.scale_setting.factor);
                     GrinderState::WaitingForRemoval {
                         portafilter_weight: 0.0,
                     }
