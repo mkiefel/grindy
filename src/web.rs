@@ -11,8 +11,8 @@ use picoserve::{make_static, AppBuilder, AppRouter};
 use serde::{Deserialize, Serialize};
 
 use crate::scale::{
-    CalibrationError, GrinderStateMachine, ScaleSetting, TargetWeightError, WeightReading,
-    WEIGHT_CHANNEL_SIZE,
+    CalibrationError, ControllerEvent, GrindFinished, GrinderStateMachine, ScaleSetting,
+    TargetWeightError, WeightReading, CONTROLLER_EVENT_CHANNEL_SIZE,
 };
 use crate::storage::{self, SharedFlash, WifiConfig};
 use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
@@ -28,17 +28,20 @@ enum WsMessage {
         scale_setting: ScaleSetting,
         target_weight: f32,
         timestamp_ms: u64,
+        lead_time: f32,
     },
     StateChange {
         state: UserEvent,
         scale_setting: ScaleSetting,
         target_weight: f32,
         timestamp_ms: u64,
+        lead_time: f32,
     },
     Weight(WeightReading),
     TargetWeightChanged {
         target_weight: f32,
     },
+    GrindFinished(GrindFinished),
 }
 
 // WebSocket connection registry
@@ -117,12 +120,13 @@ impl ws::WebSocketCallback for GrinderWebSocket {
         let queue = &WS_QUEUES[conn_id];
 
         // Send initial connected message with current state
-        let (current_state, scale_setting, target_weight) = {
+        let (current_state, scale_setting, target_weight, lead_time) = {
             let grinder_state_machine = self.grinder_state_machine.lock().await;
             (
                 grinder_state_machine.as_user_event(),
                 grinder_state_machine.get_scale_setting().clone(),
                 grinder_state_machine.get_target_weight(),
+                grinder_state_machine.get_lead_time(),
             )
         };
         let connected_msg = WsMessage::Connected {
@@ -130,6 +134,7 @@ impl ws::WebSocketCallback for GrinderWebSocket {
             scale_setting,
             target_weight,
             timestamp_ms: Instant::now().as_millis(),
+            lead_time,
         };
 
         let mut buf = [0u8; 256];
@@ -373,11 +378,11 @@ pub async fn websocket_broadcaster_task(
         UserEvent,
         USER_EVENT_CHANNEL_SIZE,
     >,
-    weight_receiver: channel::Receiver<
+    event_receiver: channel::Receiver<
         'static,
         CriticalSectionRawMutex,
-        WeightReading,
-        WEIGHT_CHANNEL_SIZE,
+        ControllerEvent,
+        CONTROLLER_EVENT_CHANNEL_SIZE,
     >,
     ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
     grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
@@ -390,11 +395,12 @@ pub async fn websocket_broadcaster_task(
                 let new_state = state_receiver
                     .changed_and(|&state| state != state_initial)
                     .await;
-                let (scale_setting, target_weight) = {
+                let (scale_setting, target_weight, lead_time) = {
                     let grinder_state_machine = grinder_state_machine.lock().await;
                     (
                         grinder_state_machine.get_scale_setting().clone(),
                         grinder_state_machine.get_target_weight(),
+                        grinder_state_machine.get_lead_time(),
                     )
                 };
                 let msg = WsMessage::StateChange {
@@ -402,16 +408,20 @@ pub async fn websocket_broadcaster_task(
                     scale_setting,
                     target_weight,
                     timestamp_ms: Instant::now().as_millis(),
+                    lead_time,
                 };
                 let registry = ws_registry.lock().await;
                 registry.broadcast(&msg);
                 state_initial = new_state;
             },
-            // Listen for weight readings
+            // Listen for controller events
             async {
-                let reading = weight_receiver.receive().await;
+                let msg = match event_receiver.receive().await {
+                    ControllerEvent::Reading(reading) => WsMessage::Weight(reading),
+                    ControllerEvent::GrindFinished(finished) => WsMessage::GrindFinished(finished),
+                };
                 let registry = ws_registry.lock().await;
-                registry.broadcast(&WsMessage::Weight(reading));
+                registry.broadcast(&msg);
             },
         )
         .await;

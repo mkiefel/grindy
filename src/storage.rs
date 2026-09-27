@@ -134,7 +134,7 @@ pub fn write_target_weight(flash: &mut FlashStorage, weight: f32) -> bool {
     ok
 }
 
-/// Reads the lead time previously stored with `write_lead_time`. Returns
+/// Reads the lead time previously stored with [`write_lead_time`]. Returns
 /// `None` if nothing has been stored yet (or the stored data is corrupt or
 /// out of range).
 pub fn read_lead_time(flash: &mut FlashStorage) -> Option<f32> {
@@ -145,6 +145,16 @@ pub fn read_lead_time(flash: &mut FlashStorage) -> Option<f32> {
         None => info!("No lead time stored in flash yet"),
     }
     lead_time
+}
+
+/// Persists `lead_time` so it can be recovered on the next boot with
+/// [`read_lead_time`]. Returns `false` if writing failed.
+pub fn write_lead_time(flash: &mut FlashStorage, lead_time: f32) -> bool {
+    let ok = write_f32(flash, LEAD_TIME_OFFSET, LEAD_TIME_MAGIC, lead_time);
+    if ok {
+        info!("Stored lead time {}s to flash", lead_time);
+    }
+    ok
 }
 
 /// Reads the WiFi configuration previously stored with [`write_wifi_config`].

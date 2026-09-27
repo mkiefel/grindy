@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::storage::{self, SharedFlash};
 use crate::ui::{UserEvent, GRIND_PROGRESS_CHANNEL_SIZE, USER_EVENT_CHANNEL_SIZE};
 
-pub const WEIGHT_CHANNEL_SIZE: usize = 4;
+pub const CONTROLLER_EVENT_CHANNEL_SIZE: usize = 4;
 pub const SCALE_CHANNEL_SIZE: usize = 5;
 
 /// A raw scale reading and when it was taken.
@@ -76,6 +76,64 @@ pub enum StopReason {
     RawWeight,
     /// `MAX_GRIND_TIME_IN_SECS` passed.
     Timeout,
+}
+
+/// Summary of a finished grind, sent once the weight settled (or the
+/// portafilter was removed before).
+#[derive(Serialize, Clone, Copy)]
+pub struct GrindFinished {
+    stop_reason: StopReason,
+    /// Coffee weight reading when the grinder stopped.
+    stop_weight: f32,
+    /// Coffee weight after the flow stopped, if it could be measured.
+    settled_weight: Option<f32>,
+    /// Lead time this grind had, if it was plausible and used for learning.
+    lead_time_observed: Option<f32>,
+    /// Lead time after learning from this grind.
+    lead_time: f32,
+}
+
+/// What the controller reports to the web clients.
+#[derive(Clone, Copy)]
+pub enum ControllerEvent {
+    Reading(WeightReading),
+    GrindFinished(GrindFinished),
+}
+
+/// Window after the stop in which the settled weight is measured.
+const SETTLE_START: Duration = Duration::from_millis(1500);
+const SETTLE_END: Duration = Duration::from_millis(2500);
+const SETTLE_SAMPLE_COUNT: usize = 16;
+/// Fewer readings in the settle window don't give a settled weight.
+const MIN_SETTLE_SAMPLES: usize = 5;
+/// Lead time changes smaller than this are not written to flash.
+const LEAD_TIME_STORE_THRESHOLD: f32 = 0.01;
+
+/// Measures the settled weight after a stop to learn the lead time.
+struct Settle {
+    stop_time: Instant,
+    stop_reason: StopReason,
+    stop_weight: f32,
+    estimator: GrindEstimator,
+    /// Coffee weight readings in the settle window.
+    samples: heapless::Vec<f32, SETTLE_SAMPLE_COUNT>,
+}
+
+impl Settle {
+    fn finish(
+        &self,
+        settled_weight: Option<f32>,
+        lead_time_observed: Option<f32>,
+        lead_time: f32,
+    ) -> GrindFinished {
+        GrindFinished {
+            stop_reason: self.stop_reason,
+            stop_weight: self.stop_weight,
+            settled_weight,
+            lead_time_observed,
+            lead_time,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -194,6 +252,8 @@ pub struct GrinderStateMachine {
     target_weight: f32,
     /// Seconds of flow still arriving after the grinder stops.
     lead_time: f32,
+    /// Lead time last persisted to flash.
+    stored_lead_time: f32,
     state: Option<GrinderState>,
 }
 
@@ -256,6 +316,8 @@ enum GrinderState {
     },
     WaitingForRemoval {
         portafilter_weight: f32,
+        /// Present after a grind until the settle window has passed.
+        settle: Option<Settle>,
     },
 }
 
@@ -276,6 +338,7 @@ impl GrinderStateMachine {
             flash,
             target_weight,
             lead_time,
+            stored_lead_time: lead_time,
             scale_setting: ScaleSetting {
                 offset: 0.0,
                 inv_variance: 0.0,
@@ -352,6 +415,12 @@ impl GrinderStateMachine {
         self.lead_time
     }
 
+    /// Largest deviation from the mean weight (3 sd of the scale noise) that
+    /// still counts as stable.
+    fn stability_threshold(&self) -> f32 {
+        math::sqrt(1.0 / self.scale_setting.inv_variance * self.scale_setting.factor.powi(2)) * 3.0
+    }
+
     /// Sets the coffee weight in grams to grind to and persists it. Takes
     /// effect immediately, even during a running grind.
     pub fn set_target_weight(&mut self, weight: f32) -> Result<(), TargetWeightError> {
@@ -397,7 +466,52 @@ impl GrinderStateMachine {
         }
     }
 
-    fn update_weight(&mut self, time: Instant, raw_weight: f32) {
+    /// Measures the settled weight of a finished settle window and learns the
+    /// lead time from it if the grind is plausible.
+    fn learn_lead_time(&mut self, mut settle: Settle) -> GrindFinished {
+        let max_deviation = self.stability_threshold();
+        let enough_samples = settle.samples.len() >= MIN_SETTLE_SAMPLES;
+        let settled_weight = compute_mean_variance(&mut settle.samples, 3.0)
+            .map(|(mean, _)| mean)
+            .filter(|&mean| {
+                enough_samples
+                    && settle
+                        .samples
+                        .iter()
+                        .all(|&weight| (weight - mean).abs() <= max_deviation)
+            });
+        let lead_time_observed = match (settle.stop_reason, settled_weight) {
+            (StopReason::Timeout, _) | (_, None) => None,
+            (_, Some(settled_weight)) => {
+                lead_time::observe_lead_time(&settle.estimator, settled_weight)
+            }
+        };
+
+        match lead_time_observed {
+            Some(observed) => {
+                let lead_time = lead_time::update_lead_time(self.lead_time, observed);
+                info!(
+                    "Settled at {}g, lead time observed {}s, now {}s",
+                    settled_weight, observed, lead_time
+                );
+                self.lead_time = lead_time;
+                if (lead_time - self.stored_lead_time).abs() > LEAD_TIME_STORE_THRESHOLD
+                    && self
+                        .flash
+                        .lock(|flash| storage::write_lead_time(&mut flash.borrow_mut(), lead_time))
+                {
+                    self.stored_lead_time = lead_time;
+                }
+            }
+            None => info!(
+                "Not learning the lead time from this grind (settled weight {}g)",
+                settled_weight
+            ),
+        }
+        settle.finish(settled_weight, lead_time_observed, self.lead_time)
+    }
+
+    fn update_weight(&mut self, time: Instant, raw_weight: f32) -> Option<GrindFinished> {
         // Minimum weight to detect portafilter placement.
         const PORTAFILTER_THRESHOLD: f32 = 100.0;
         // Weight below which we consider portafilter removed.
@@ -405,6 +519,7 @@ impl GrinderStateMachine {
 
         let weight = self.scale_setting.translate(raw_weight);
         debug!("weight: {}", weight);
+        let mut finished = None;
         self.state = Some(match self.state.take().unwrap() {
             GrinderState::Tare {
                 mut samples,
@@ -459,9 +574,7 @@ impl GrinderStateMachine {
                 let (mean_weight, _) =
                     compute_mean_variance(&mut samples, 3.0).unwrap_or((weight, 0.0));
 
-                let threshold = math::sqrt(
-                    1.0 / self.scale_setting.inv_variance * self.scale_setting.factor.powi(2),
-                ) * 3.0;
+                let threshold = self.stability_threshold();
 
                 if weight < calibration_weight * CALIBRATION_DETECTION_FRACTION {
                     info!("Calibration weight removed during calibration - waiting for placement");
@@ -488,6 +601,7 @@ impl GrinderStateMachine {
                     });
                     GrinderState::WaitingForRemoval {
                         portafilter_weight: 0.0,
+                        settle: None,
                     }
                 } else {
                     GrinderState::Calibrating {
@@ -515,9 +629,7 @@ impl GrinderStateMachine {
                 let (portafilter_weight, _) =
                     compute_mean_variance(&mut samples, 3.0).unwrap_or((weight, 0.0));
 
-                let threshold = math::sqrt(
-                    1.0 / self.scale_setting.inv_variance * self.scale_setting.factor.powi(2),
-                ) * 3.0;
+                let threshold = self.stability_threshold();
 
                 if weight < PORTAFILTER_THRESHOLD {
                     // Portafilter removed during stabilization
@@ -586,7 +698,16 @@ impl GrinderStateMachine {
                             stop_reason, coffee_weight, self.lead_time
                         );
                         self.grinder.set_high();
-                        GrinderState::WaitingForRemoval { portafilter_weight }
+                        GrinderState::WaitingForRemoval {
+                            portafilter_weight,
+                            settle: Some(Settle {
+                                stop_time: time,
+                                stop_reason,
+                                stop_weight: coffee_weight,
+                                estimator,
+                                samples: heapless::Vec::new(),
+                            }),
+                        }
                     }
                     None => GrinderState::Grinding {
                         start_time,
@@ -596,15 +717,42 @@ impl GrinderStateMachine {
                 }
             }
 
-            GrinderState::WaitingForRemoval { portafilter_weight } => {
+            GrinderState::WaitingForRemoval {
+                portafilter_weight,
+                settle,
+            } => {
                 if weight < REMOVAL_THRESHOLD {
                     info!("Portafilter removed - ready for next cycle");
+                    if let Some(settle) = settle {
+                        info!("Removed before the weight settled - not learning the lead time");
+                        finished = Some(settle.finish(None, None, self.lead_time));
+                    }
                     GrinderState::WaitingForPortafilter {}
                 } else {
-                    GrinderState::WaitingForRemoval { portafilter_weight }
+                    let settle = match settle {
+                        Some(mut settle) => {
+                            let since_stop = time.saturating_duration_since(settle.stop_time);
+                            if since_stop >= SETTLE_END {
+                                finished = Some(self.learn_lead_time(settle));
+                                None
+                            } else {
+                                if since_stop >= SETTLE_START {
+                                    // A full buffer just keeps the first readings.
+                                    settle.samples.push(weight - portafilter_weight).ok();
+                                }
+                                Some(settle)
+                            }
+                        }
+                        None => None,
+                    };
+                    GrinderState::WaitingForRemoval {
+                        portafilter_weight,
+                        settle,
+                    }
                 }
             }
-        })
+        });
+        finished
     }
 }
 
@@ -627,7 +775,12 @@ pub async fn controller_task(
         f32,
         GRIND_PROGRESS_CHANNEL_SIZE,
     >,
-    weight_sender: channel::Sender<'static, CriticalSectionRawMutex, WeightReading, WEIGHT_CHANNEL_SIZE>,
+    event_sender: channel::Sender<
+        'static,
+        CriticalSectionRawMutex,
+        ControllerEvent,
+        CONTROLLER_EVENT_CHANNEL_SIZE,
+    >,
     grinder_state_machine: &mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
 ) {
     let mut last_event = {
@@ -639,9 +792,9 @@ pub async fn controller_task(
 
     loop {
         let (time, raw_weight) = scale_receiver.receive().await;
-        let (event, weight, coffee_weight, target_weight, estimate) = {
+        let (event, weight, coffee_weight, target_weight, estimate, finished) = {
             let mut grinder_state_machine_guard = grinder_state_machine.lock().await;
-            grinder_state_machine_guard.update_weight(time, raw_weight);
+            let finished = grinder_state_machine_guard.update_weight(time, raw_weight);
             let event = grinder_state_machine_guard.as_user_event();
             let weight = grinder_state_machine_guard
                 .scale_setting
@@ -649,7 +802,7 @@ pub async fn controller_task(
             let coffee_weight = grinder_state_machine_guard.get_coffee_weight(weight);
             let target_weight = grinder_state_machine_guard.get_target_weight();
             let estimate = grinder_state_machine_guard.grind_estimate();
-            (event, weight, coffee_weight, target_weight, estimate)
+            (event, weight, coffee_weight, target_weight, estimate, finished)
         };
         let filtered_weight = estimate.map(|(filtered_weight, _)| filtered_weight);
         let eta = estimate.and_then(|(_, eta)| eta).map(EtaReading::from);
@@ -673,6 +826,10 @@ pub async fn controller_task(
             filtered_weight,
             eta,
         );
-        weight_sender.try_send(reading).ok();
+        event_sender.try_send(ControllerEvent::Reading(reading)).ok();
+        if let Some(finished) = finished {
+            // Once per grind, so wait for room rather than dropping it.
+            event_sender.send(ControllerEvent::GrindFinished(finished)).await;
+        }
     }
 }
