@@ -1,4 +1,4 @@
-use libm::expf;
+use libm::{erfcf, expf, sqrtf};
 
 /// Hyperparameters of the GP. Times in s, weights in g.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -20,6 +20,23 @@ pub struct Gaussian {
     pub mean: f32,
     pub var: f32,
 }
+
+/// Time until the weight reaches a target, in seconds after the last update.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Eta {
+    /// 50 % quantile: where the forecast mean reaches the target.
+    pub median: f32,
+    /// 10 % quantile.
+    pub lo: f32,
+    /// 90 % quantile, at most [`MAX_ETA`].
+    pub hi: f32,
+}
+
+/// ETAs further out than this are reported as unknown.
+pub const MAX_ETA: f32 = 60.0;
+/// Grid the ETA quantiles are first searched on, refined by bisection.
+const ETA_GRID_STEP: f32 = 0.25;
+const ETA_BISECTIONS: u32 = 16;
 
 type Vec3 = [f32; 3];
 type Mat3 = [[f32; 3]; 3];
@@ -152,5 +169,54 @@ impl GrindEstimator {
     /// Covariance of `[weight, rate, mean rate]`, for tests and diagnostics.
     pub fn covariance(&self) -> [[f32; 3]; 3] {
         self.p
+    }
+
+    /// Probability that the weight reached `target` within `h` seconds after
+    /// the last update, approximated by P(w(t_last + h) ≥ target).
+    fn reached_probability(&self, h: f32, target: f32) -> f32 {
+        let f = self.forecast(self.t_last + h);
+        let sd = sqrtf(f.var.max(1e-12));
+        0.5 * erfcf((target - f.mean) / (sd * core::f32::consts::SQRT_2))
+    }
+
+    /// First time after the last update at which the probability of having
+    /// reached `target` is at least `quantile`, if within [`MAX_ETA`].
+    fn eta_quantile(&self, target: f32, quantile: f32) -> Option<f32> {
+        if self.reached_probability(0.0, target) >= quantile {
+            return Some(0.0);
+        }
+        let mut before = 0.0;
+        let mut h = ETA_GRID_STEP;
+        while h <= MAX_ETA {
+            if self.reached_probability(h, target) >= quantile {
+                let (mut lo, mut hi) = (before, h);
+                for _ in 0..ETA_BISECTIONS {
+                    let mid = 0.5 * (lo + hi);
+                    if self.reached_probability(mid, target) >= quantile {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                return Some(hi);
+            }
+            before = h;
+            h += ETA_GRID_STEP;
+        }
+        None
+    }
+
+    /// When the weight is expected to reach `target`, or `None` if that is
+    /// not expected within [`MAX_ETA`] (or before the first update).
+    pub fn eta(&self, target: f32) -> Option<Eta> {
+        if self.updates == 0 {
+            return None;
+        }
+        let median = self.eta_quantile(target, 0.5)?;
+        Some(Eta {
+            median,
+            lo: self.eta_quantile(target, 0.1).unwrap_or(median),
+            hi: self.eta_quantile(target, 0.9).unwrap_or(MAX_ETA),
+        })
     }
 }

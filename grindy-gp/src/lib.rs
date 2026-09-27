@@ -10,7 +10,7 @@
 mod estimator;
 mod fitted;
 
-pub use estimator::{Gaussian, GrindEstimator, Params};
+pub use estimator::{Eta, Gaussian, GrindEstimator, Params, MAX_ETA};
 pub use fitted::{DEFAULT_LEAD_TIME, FITTED};
 
 /// Seconds after the grinder starts before readings go into the estimator.
