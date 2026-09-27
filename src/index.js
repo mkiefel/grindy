@@ -61,17 +61,7 @@ class PostcardDecoder {
     };
   }
 
-  // Decode Vec<T> - varint length followed by elements
-  readVec(readFn) {
-    const length = this.readVarint();
-    const vec = [];
-    for (let i = 0; i < length; i++) {
-      vec.push(readFn.call(this));
-    }
-    return vec;
-  }
-
-  // Decode WsMessage enum (varint tag: 0=Connected, 1=StateChange, 2=WeightBatch,
+  // Decode WsMessage enum (varint tag: 0=Connected, 1=StateChange, 2=Weight,
   // 3=TargetWeightChanged)
   readWsMessage() {
     const variant = this.readVarint();
@@ -92,10 +82,10 @@ class PostcardDecoder {
           targetWeight: this.readF32(),
           timestampMs: this.readVarint()
         };
-      case 2: // WeightBatch
+      case 2: // Weight
         return {
-          type: 'weightBatch',
-          readings: this.readVec(this.readWeightReading)
+          type: 'weight',
+          reading: this.readWeightReading()
         };
       case 3: // TargetWeightChanged
         return {
@@ -445,34 +435,25 @@ function drawGrindChart() {
   }
 }
 
-function handleWeightBatch(readings) {
-  if (readings && readings.length > 0) {
-    let chartChanged = false;
-    for (const reading of readings) {
-      if (recordGrindReading(reading)) chartChanged = true;
-    }
-    if (chartChanged) drawGrindChart();
+function handleWeight(reading) {
+  if (recordGrindReading(reading)) drawGrindChart();
 
-    // Use the most recent reading
-    const latest = readings[readings.length - 1];
+  const TARGET_WEIGHT = targetWeight || 18.0;
+  let progress = 0;
+  let displayWeight = reading.weight;
 
-    const TARGET_WEIGHT = targetWeight || 18.0;
-    let progress = 0;
-    let displayWeight = latest.weight;
-
-    // Use coffee weight if available (during grinding)
-    if (latest.coffeeWeight !== undefined && latest.coffeeWeight !== null) {
-      displayWeight = latest.coffeeWeight;
-      progress = Math.min(100, Math.round((latest.coffeeWeight / TARGET_WEIGHT) * 100));
-    } else if (latest.state === 'Grinding') {
-      // Fallback: assume total weight includes ~100g portafilter
-      const estimatedCoffeeWeight = Math.max(0, latest.weight - 100);
-      displayWeight = estimatedCoffeeWeight;
-      progress = Math.min(100, Math.round((estimatedCoffeeWeight / TARGET_WEIGHT) * 100));
-    }
-
-    updateUI(latest.state, displayWeight, progress);
+  // Use coffee weight if available (during grinding)
+  if (reading.coffeeWeight !== undefined && reading.coffeeWeight !== null) {
+    displayWeight = reading.coffeeWeight;
+    progress = Math.min(100, Math.round((reading.coffeeWeight / TARGET_WEIGHT) * 100));
+  } else if (reading.state === 'Grinding') {
+    // Fallback: assume total weight includes ~100g portafilter
+    const estimatedCoffeeWeight = Math.max(0, reading.weight - 100);
+    displayWeight = estimatedCoffeeWeight;
+    progress = Math.min(100, Math.round((estimatedCoffeeWeight / TARGET_WEIGHT) * 100));
   }
+
+  updateUI(reading.state, displayWeight, progress);
 }
 
 function handleMessage(arrayBuffer) {
@@ -497,8 +478,8 @@ function handleMessage(arrayBuffer) {
         setTargetWeight(msg.targetWeight);
         break;
 
-      case 'weightBatch':
-        handleWeightBatch(msg.readings);
+      case 'weight':
+        handleWeight(msg.reading);
         break;
 
       default:

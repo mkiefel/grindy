@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::storage::{self, SharedFlash};
 use crate::ui::{UserEvent, GRIND_PROGRESS_CHANNEL_SIZE, USER_EVENT_CHANNEL_SIZE};
 
-pub const WEIGHT_BATCH_CHANNEL_SIZE: usize = 2;
+pub const WEIGHT_CHANNEL_SIZE: usize = 4;
 pub const SCALE_CHANNEL_SIZE: usize = 5;
 
 #[derive(Serialize, Clone, Copy)]
@@ -533,12 +533,7 @@ pub async fn controller_task(
         f32,
         GRIND_PROGRESS_CHANNEL_SIZE,
     >,
-    weight_batch_sender: channel::Sender<
-        'static,
-        CriticalSectionRawMutex,
-        heapless::Vec<WeightReading, 4>,
-        WEIGHT_BATCH_CHANNEL_SIZE,
-    >,
+    weight_sender: channel::Sender<'static, CriticalSectionRawMutex, WeightReading, WEIGHT_CHANNEL_SIZE>,
     grinder_state_machine: &mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
 ) {
     let mut last_event = {
@@ -548,45 +543,31 @@ pub async fn controller_task(
         event
     };
 
-    let mut weight_batch = heapless::Vec::<WeightReading, 4>::new();
-    const BATCH_INTERVAL: Duration = Duration::from_millis(100);
-
     loop {
-        // Try to receive a weight reading with timeout.
-        let raw_weight_opt =
-            embassy_time::with_timeout(BATCH_INTERVAL, scale_receiver.receive()).await;
-
-        if let Ok(raw_weight) = raw_weight_opt {
-            let (event, weight, coffee_weight, target_weight) = {
-                let mut grinder_state_machine_guard = grinder_state_machine.lock().await;
-                grinder_state_machine_guard.update_weight(raw_weight);
-                let event = grinder_state_machine_guard.as_user_event();
-                let weight = grinder_state_machine_guard
-                    .scale_setting
-                    .translate(raw_weight);
-                let coffee_weight = grinder_state_machine_guard.get_coffee_weight(weight);
-                let target_weight = grinder_state_machine_guard.get_target_weight();
-                (event, weight, coffee_weight, target_weight)
-            };
-            // Sent before the state so the LED strip never picks up a stale
-            // progress from the previous grind when grinding starts.
-            if let (UserEvent::Grinding, Some(coffee_weight)) = (event, coffee_weight) {
-                grind_progress_sender.send((coffee_weight / target_weight).clamp(0.0, 1.0));
-            }
-            if event != last_event {
-                last_event = event;
-                state_sender.send(event);
-            }
-
-            // Add weight reading to batch
-            let reading =
-                WeightReading::new(Instant::now().as_millis(), weight, event, coffee_weight);
-            let _ = weight_batch.push(reading);
+        let raw_weight = scale_receiver.receive().await;
+        let (event, weight, coffee_weight, target_weight) = {
+            let mut grinder_state_machine_guard = grinder_state_machine.lock().await;
+            grinder_state_machine_guard.update_weight(raw_weight);
+            let event = grinder_state_machine_guard.as_user_event();
+            let weight = grinder_state_machine_guard
+                .scale_setting
+                .translate(raw_weight);
+            let coffee_weight = grinder_state_machine_guard.get_coffee_weight(weight);
+            let target_weight = grinder_state_machine_guard.get_target_weight();
+            (event, weight, coffee_weight, target_weight)
+        };
+        // Sent before the state so the LED strip never picks up a stale
+        // progress from the previous grind when grinding starts.
+        if let (UserEvent::Grinding, Some(coffee_weight)) = (event, coffee_weight) {
+            grind_progress_sender.send((coffee_weight / target_weight).clamp(0.0, 1.0));
+        }
+        if event != last_event {
+            last_event = event;
+            state_sender.send(event);
         }
 
-        if weight_batch.is_full() {
-            weight_batch_sender.try_send(weight_batch.clone()).ok();
-            weight_batch.clear();
-        }
+        let reading =
+            WeightReading::new(Instant::now().as_millis(), weight, event, coffee_weight);
+        weight_sender.try_send(reading).ok();
     }
 }

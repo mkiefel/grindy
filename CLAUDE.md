@@ -74,6 +74,8 @@ State transitions are driven by weight readings from the scale channel.
 - **scale_task → controller_task**: `channel::Channel<f32>` (size 5) for raw weight readings
 - **controller_task → led_task**: `watch::Watch<UserEvent>` for state broadcasts
 - **controller_task → led_strip_task**: `watch::Watch<f32>` grind progress (0..1, coffee/target weight) while grinding; the strip switches green LEDs on one by one (with hysteresis against flicker)
+- **controller_task → websocket_broadcaster_task**: `channel::Channel<WeightReading>` (size 4), one reading per scale sample
+- **websocket_broadcaster_task / web handlers → WebSocket clients**: `WsConnectionRegistry` broadcasts each `WsMessage` into a per-connection queue (`WS_QUEUES`, 16 messages each); a client that falls that far behind has messages dropped
 - **web tasks**: Access state via shared `Mutex<GrinderStateMachine>`
 
 ### Network Configuration

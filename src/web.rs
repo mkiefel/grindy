@@ -1,6 +1,6 @@
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, mutex, signal, watch};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, mutex, watch};
 use embassy_time::{Duration, Instant};
 use picoserve::futures::Either;
 use picoserve::response::ws;
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::scale::{
     CalibrationError, GrinderStateMachine, ScaleSetting, TargetWeightError, WeightReading,
-    WEIGHT_BATCH_CHANNEL_SIZE,
+    WEIGHT_CHANNEL_SIZE,
 };
 use crate::storage::{self, SharedFlash, WifiConfig};
 use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
@@ -35,9 +35,7 @@ enum WsMessage {
         target_weight: f32,
         timestamp_ms: u64,
     },
-    WeightBatch {
-        readings: heapless::Vec<WeightReading, 4>,
-    },
+    Weight(WeightReading),
     TargetWeightChanged {
         target_weight: f32,
     },
@@ -45,42 +43,44 @@ enum WsMessage {
 
 // WebSocket connection registry
 const MAX_WS_CONNECTIONS: usize = 4;
+/// Messages buffered per connection; further messages are dropped for a client
+/// that falls this far behind.
+const WS_QUEUE_SIZE: usize = 16;
+
+type WsQueue = channel::Channel<CriticalSectionRawMutex, WsMessage, WS_QUEUE_SIZE>;
+
+static WS_QUEUES: [WsQueue; MAX_WS_CONNECTIONS] = [const { WsQueue::new() }; MAX_WS_CONNECTIONS];
 
 pub struct WsConnectionRegistry {
-    connections:
-        [Option<&'static signal::Signal<CriticalSectionRawMutex, WsMessage>>; MAX_WS_CONNECTIONS],
+    connected: [bool; MAX_WS_CONNECTIONS],
 }
 
 impl WsConnectionRegistry {
     pub const fn new() -> Self {
         Self {
-            connections: [None; MAX_WS_CONNECTIONS],
+            connected: [false; MAX_WS_CONNECTIONS],
         }
     }
 
-    fn register(
-        &mut self,
-        signal: &'static signal::Signal<CriticalSectionRawMutex, WsMessage>,
-    ) -> Option<usize> {
-        for (idx, slot) in self.connections.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(signal);
-                return Some(idx);
-            }
-        }
-        None
+    /// Claims a free slot and returns its index; its queue is `WS_QUEUES[idx]`.
+    fn register(&mut self) -> Option<usize> {
+        let idx = self.connected.iter().position(|&connected| !connected)?;
+        self.connected[idx] = true;
+        // Drop anything left over from the slot's previous connection.
+        WS_QUEUES[idx].clear();
+        Some(idx)
     }
 
     fn unregister(&mut self, idx: usize) {
         if idx < MAX_WS_CONNECTIONS {
-            self.connections[idx] = None;
+            self.connected[idx] = false;
         }
     }
 
     fn broadcast(&self, msg: &WsMessage) {
-        for slot in self.connections.iter() {
-            if let Some(signal) = slot {
-                signal.signal(msg.clone());
+        for (idx, queue) in WS_QUEUES.iter().enumerate() {
+            if self.connected[idx] && queue.try_send(msg.clone()).is_err() {
+                warn!("WebSocket client {} queue full, dropping message", idx);
             }
         }
     }
@@ -90,7 +90,6 @@ impl WsConnectionRegistry {
 struct GrinderWebSocket {
     registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
     grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
-    signal: &'static signal::Signal<CriticalSectionRawMutex, WsMessage>,
 }
 
 impl ws::WebSocketCallback for GrinderWebSocket {
@@ -102,7 +101,7 @@ impl ws::WebSocketCallback for GrinderWebSocket {
         // Register connection
         let conn_id = {
             let mut registry = self.registry.lock().await;
-            registry.register(self.signal)
+            registry.register()
         };
 
         let conn_id = match conn_id {
@@ -115,6 +114,7 @@ impl ws::WebSocketCallback for GrinderWebSocket {
         };
 
         info!("WebSocket client {} connected", conn_id);
+        let queue = &WS_QUEUES[conn_id];
 
         // Send initial connected message with current state
         let (current_state, scale_setting, target_weight) = {
@@ -140,7 +140,7 @@ impl ws::WebSocketCallback for GrinderWebSocket {
         // Main loop: handle both broadcast messages and client messages
         let mut buffer = [0u8; 128];
         loop {
-            match rx.next_message(&mut buffer, self.signal.wait()).await {
+            match rx.next_message(&mut buffer, queue.receive()).await {
                 Ok(Either::First(msg)) => {
                     match msg {
                         Ok(ws::Message::Close(_)) => {
@@ -335,34 +335,10 @@ impl AppBuilder for AppProps {
                 "/ws",
                 get(
                     move |upgrade: picoserve::response::WebSocketUpgrade| async move {
-                        // Allocate a new signal for this connection
-                        // Note: This is a simplified version - in production we'd need a pool
-                        static WS_SIGNALS: [signal::Signal<CriticalSectionRawMutex, WsMessage>;
-                            MAX_WS_CONNECTIONS] = [
-                            signal::Signal::new(),
-                            signal::Signal::new(),
-                            signal::Signal::new(),
-                            signal::Signal::new(),
-                        ];
-
-                        // Find an available signal
-                        let signal_idx = {
-                            let registry = ws_registry.lock().await;
-                            let mut idx = 0;
-                            for (i, conn) in registry.connections.iter().enumerate() {
-                                if conn.is_none() {
-                                    idx = i;
-                                    break;
-                                }
-                            }
-                            idx
-                        };
-
                         upgrade
                             .on_upgrade(GrinderWebSocket {
                                 registry: ws_registry,
                                 grinder_state_machine,
-                                signal: &WS_SIGNALS[signal_idx],
                             })
                             .with_protocol("grindy")
                     },
@@ -397,11 +373,11 @@ pub async fn websocket_broadcaster_task(
         UserEvent,
         USER_EVENT_CHANNEL_SIZE,
     >,
-    weight_batch_receiver: channel::Receiver<
+    weight_receiver: channel::Receiver<
         'static,
         CriticalSectionRawMutex,
-        heapless::Vec<WeightReading, 4>,
-        WEIGHT_BATCH_CHANNEL_SIZE,
+        WeightReading,
+        WEIGHT_CHANNEL_SIZE,
     >,
     ws_registry: &'static mutex::Mutex<CriticalSectionRawMutex, WsConnectionRegistry>,
     grinder_state_machine: &'static mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
@@ -431,14 +407,11 @@ pub async fn websocket_broadcaster_task(
                 registry.broadcast(&msg);
                 state_initial = new_state;
             },
-            // Listen for weight batches
+            // Listen for weight readings
             async {
-                let batch = weight_batch_receiver.receive().await;
-                if !batch.is_empty() {
-                    let msg = WsMessage::WeightBatch { readings: batch };
-                    let registry = ws_registry.lock().await;
-                    registry.broadcast(&msg);
-                }
+                let reading = weight_receiver.receive().await;
+                let registry = ws_registry.lock().await;
+                registry.broadcast(&WsMessage::Weight(reading));
             },
         )
         .await;

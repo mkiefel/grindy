@@ -31,7 +31,7 @@ mod wifi;
 
 use crate::scale::{
     controller_task, scale_task, GrinderStateMachine, WeightReading, SCALE_CHANNEL_SIZE,
-    WEIGHT_BATCH_CHANNEL_SIZE,
+    WEIGHT_CHANNEL_SIZE,
 };
 use crate::storage::{FlashStorage, SharedFlash};
 use crate::ui::{
@@ -163,15 +163,15 @@ async fn main(spawner: Spawner) {
         StaticCell::new();
     let ws_registry = WS_REGISTRY.init(mutex::Mutex::new(WsConnectionRegistry::new()));
 
-    static WEIGHT_BATCH_CHANNEL: channel::Channel<
+    static WEIGHT_CHANNEL: channel::Channel<
         CriticalSectionRawMutex,
-        heapless::Vec<WeightReading, 4>,
-        WEIGHT_BATCH_CHANNEL_SIZE,
+        WeightReading,
+        WEIGHT_CHANNEL_SIZE,
     > = channel::Channel::new();
 
     spawner.must_spawn(websocket_broadcaster_task(
         unwrap!(STATE_WATCH.receiver()),
-        WEIGHT_BATCH_CHANNEL.receiver(),
+        WEIGHT_CHANNEL.receiver(),
         ws_registry,
         grinder_state_machine,
     ));
@@ -189,7 +189,7 @@ async fn main(spawner: Spawner) {
         SCALE_CHANNEL.receiver(),
         STATE_WATCH.sender(),
         GRIND_PROGRESS_WATCH.sender(),
-        WEIGHT_BATCH_CHANNEL.sender(),
+        WEIGHT_CHANNEL.sender(),
         &grinder_state_machine,
     )
     .await;
