@@ -27,6 +27,11 @@ const TARGET_WEIGHT_OFFSET: u32 = WIFI_CONFIG_OFFSET + ERASE_SIZE as u32;
 
 const TARGET_WEIGHT_MAGIC: u32 = 0x6772_7477; // "grtw"
 
+/// Offset of the lead time sector, right after the target weight one.
+const LEAD_TIME_OFFSET: u32 = TARGET_WEIGHT_OFFSET + ERASE_SIZE as u32;
+
+const LEAD_TIME_MAGIC: u32 = 0x6772_7461; // "grta"
+
 pub const MAX_SSID_LEN: usize = 32;
 pub const MAX_PASSWORD_LEN: usize = 63;
 /// WPA2 passphrases have to be at least this long; an empty password means an
@@ -127,6 +132,19 @@ pub fn write_target_weight(flash: &mut FlashStorage, weight: f32) -> bool {
         info!("Stored target weight {}g to flash", weight);
     }
     ok
+}
+
+/// Reads the lead time previously stored with `write_lead_time`. Returns
+/// `None` if nothing has been stored yet (or the stored data is corrupt or
+/// out of range).
+pub fn read_lead_time(flash: &mut FlashStorage) -> Option<f32> {
+    let lead_time = read_f32(flash, LEAD_TIME_OFFSET, LEAD_TIME_MAGIC)
+        .filter(|lead_time| (0.0..=grindy_gp::lead_time::MAX_LEAD_TIME).contains(lead_time));
+    match lead_time {
+        Some(lead_time) => info!("Loaded lead time {}s from flash", lead_time),
+        None => info!("No lead time stored in flash yet"),
+    }
+    lead_time
 }
 
 /// Reads the WiFi configuration previously stored with [`write_wifi_config`].

@@ -27,6 +27,7 @@ picoserve = { git = "https://github.com/sammhicks/picoserve.git", rev = "e0f9418
 serde = { version = "~1.0", default-features = false, features = ["derive"] }
 postcard = { version = "~1.0", default-features = false, features = ["heapless"] }
 smart-leds = "~0.4"
+grindy-gp = { path = "grindy-gp" }
 
 [[bin]]
 name = "grindy"

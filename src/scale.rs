@@ -3,6 +3,8 @@ use defmt::*;
 use embassy_rp::gpio::{Input, Output};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel, mutex, watch};
 use embassy_time::{Delay, Duration, Instant, Timer};
+use grindy_gp::lead_time;
+use grindy_gp::{GrindEstimator, DEFAULT_LEAD_TIME, FITTED, RAMP_UP};
 use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
 use serde::Serialize;
@@ -13,12 +15,36 @@ use crate::ui::{UserEvent, GRIND_PROGRESS_CHANNEL_SIZE, USER_EVENT_CHANNEL_SIZE}
 pub const WEIGHT_CHANNEL_SIZE: usize = 4;
 pub const SCALE_CHANNEL_SIZE: usize = 5;
 
+/// A raw scale reading and when it was taken.
+pub type ScaleSample = (Instant, f32);
+
+/// Seconds until the grinder is expected to stop (10/50/90 % quantiles).
+#[derive(Serialize, Clone, Copy)]
+pub struct EtaReading {
+    median: f32,
+    lo: f32,
+    hi: f32,
+}
+
+impl From<grindy_gp::Eta> for EtaReading {
+    fn from(eta: grindy_gp::Eta) -> Self {
+        Self {
+            median: eta.median,
+            lo: eta.lo,
+            hi: eta.hi,
+        }
+    }
+}
+
 #[derive(Serialize, Clone, Copy)]
 pub struct WeightReading {
     timestamp_ms: u64,
     weight: f32,
     state: UserEvent,
     coffee_weight: Option<f32>,
+    /// Coffee weight estimated by the GP while grinding.
+    filtered_weight: Option<f32>,
+    eta: Option<EtaReading>,
 }
 
 impl WeightReading {
@@ -27,14 +53,29 @@ impl WeightReading {
         weight: f32,
         state: UserEvent,
         coffee_weight: Option<f32>,
+        filtered_weight: Option<f32>,
+        eta: Option<EtaReading>,
     ) -> Self {
         Self {
             timestamp_ms,
             weight,
             state,
             coffee_weight,
+            filtered_weight,
+            eta,
         }
     }
+}
+
+/// Why the grinder was stopped. The order is part of the wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Format)]
+pub enum StopReason {
+    /// The estimator forecast the target after the lead time.
+    Prediction,
+    /// The reading itself reached the target.
+    RawWeight,
+    /// `MAX_GRIND_TIME_IN_SECS` passed.
+    Timeout,
 }
 
 #[derive(Clone, Serialize)]
@@ -117,7 +158,7 @@ fn compute_median<const N: usize>(data: &mut heapless::Vec<f32, N>) -> f32 {
 pub async fn scale_task(
     sck: Output<'static>,
     dt: Input<'static>,
-    sender: channel::Sender<'static, CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE>,
+    sender: channel::Sender<'static, CriticalSectionRawMutex, ScaleSample, SCALE_CHANNEL_SIZE>,
 ) {
     debug!("Setting up scale...");
     let delay = Delay {};
@@ -128,7 +169,7 @@ pub async fn scale_task(
         if scale.is_ready() {
             match scale.read() {
                 Ok(r) => {
-                    sender.send(-r as f32).await;
+                    sender.send((Instant::now(), -r as f32)).await;
                 }
                 Err(_) => {
                     warn!("Failed to read scale although it was ready.");
@@ -151,6 +192,8 @@ pub struct GrinderStateMachine {
     scale_setting: ScaleSetting,
     /// Coffee weight in grams to grind to.
     target_weight: f32,
+    /// Seconds of flow still arriving after the grinder stops.
+    lead_time: f32,
     state: Option<GrinderState>,
 }
 
@@ -209,6 +252,7 @@ enum GrinderState {
     Grinding {
         start_time: Instant,
         portafilter_weight: f32,
+        estimator: GrindEstimator,
     },
     WaitingForRemoval {
         portafilter_weight: f32,
@@ -224,10 +268,14 @@ impl GrinderStateMachine {
             .lock(|flash| storage::read_target_weight(&mut flash.borrow_mut()))
             .filter(|weight| (MIN_TARGET_WEIGHT..=MAX_TARGET_WEIGHT).contains(weight))
             .unwrap_or(DEFAULT_TARGET_WEIGHT);
+        let lead_time = flash
+            .lock(|flash| storage::read_lead_time(&mut flash.borrow_mut()))
+            .unwrap_or(DEFAULT_LEAD_TIME);
         Self {
             grinder,
             flash,
             target_weight,
+            lead_time,
             scale_setting: ScaleSetting {
                 offset: 0.0,
                 inv_variance: 0.0,
@@ -300,6 +348,10 @@ impl GrinderStateMachine {
         self.target_weight
     }
 
+    pub fn get_lead_time(&self) -> f32 {
+        self.lead_time
+    }
+
     /// Sets the coffee weight in grams to grind to and persists it. Takes
     /// effect immediately, even during a running grind.
     pub fn set_target_weight(&mut self, weight: f32) -> Result<(), TargetWeightError> {
@@ -329,7 +381,23 @@ impl GrinderStateMachine {
         }
     }
 
-    fn update_weight(&mut self, raw_weight: f32) {
+    /// Estimated coffee weight and time until the grinder is expected to
+    /// stop, while grinding and once the estimator has enough readings.
+    fn grind_estimate(&self) -> Option<(f32, Option<grindy_gp::Eta>)> {
+        match self.state.as_ref().unwrap() {
+            GrinderState::Grinding { estimator, .. }
+                if estimator.updates() >= lead_time::MIN_UPDATES_FOR_STOP =>
+            {
+                Some((
+                    estimator.weight().mean,
+                    lead_time::stop_eta(estimator, self.lead_time, self.target_weight),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn update_weight(&mut self, time: Instant, raw_weight: f32) {
         // Minimum weight to detect portafilter placement.
         const PORTAFILTER_THRESHOLD: f32 = 100.0;
         // Weight below which we consider portafilter removed.
@@ -469,8 +537,9 @@ impl GrinderStateMachine {
                     info!("Weight stabilized at {}g - starting grind!", weight);
                     self.grinder.set_low();
                     GrinderState::Grinding {
-                        start_time: Instant::now(),
+                        start_time: time,
                         portafilter_weight,
+                        estimator: GrindEstimator::new(FITTED),
                     }
                 } else {
                     GrinderState::Stabilizing { samples }
@@ -480,8 +549,14 @@ impl GrinderStateMachine {
             GrinderState::Grinding {
                 start_time,
                 portafilter_weight,
+                mut estimator,
             } => {
                 let coffee_weight = weight - portafilter_weight;
+                let elapsed = time.saturating_duration_since(start_time);
+                let t = elapsed.as_micros() as f32 / 1_000_000.0;
+                if t >= RAMP_UP {
+                    estimator.update(t, coffee_weight);
+                }
 
                 info!(
                     "Grinding... Coffee: {}g (Total: {}g)",
@@ -489,21 +564,35 @@ impl GrinderStateMachine {
                     weight
                 );
 
-                if coffee_weight >= self.target_weight
-                    || Instant::now() - start_time
-                        >= Duration::from_secs(MAX_GRIND_TIME_IN_SECS as u64)
-                {
-                    info!(
-                        "Target reached! {}g coffee ground - stopping grinder",
-                        (coffee_weight * 10.0).floor() / 10.0
-                    );
-                    self.grinder.set_high();
-                    GrinderState::WaitingForRemoval { portafilter_weight }
+                let stop_reason = if lead_time::should_stop(
+                    &estimator,
+                    t,
+                    self.lead_time,
+                    self.target_weight,
+                ) {
+                    Some(StopReason::Prediction)
+                } else if coffee_weight >= self.target_weight {
+                    Some(StopReason::RawWeight)
+                } else if elapsed >= Duration::from_secs(MAX_GRIND_TIME_IN_SECS as u64) {
+                    Some(StopReason::Timeout)
                 } else {
-                    GrinderState::Grinding {
+                    None
+                };
+
+                match stop_reason {
+                    Some(stop_reason) => {
+                        info!(
+                            "Stopping grinder ({}) at {}g coffee, lead time {}s",
+                            stop_reason, coffee_weight, self.lead_time
+                        );
+                        self.grinder.set_high();
+                        GrinderState::WaitingForRemoval { portafilter_weight }
+                    }
+                    None => GrinderState::Grinding {
                         start_time,
                         portafilter_weight,
-                    }
+                        estimator,
+                    },
                 }
             }
 
@@ -520,7 +609,12 @@ impl GrinderStateMachine {
 }
 
 pub async fn controller_task(
-    scale_receiver: channel::Receiver<'static, CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE>,
+    scale_receiver: channel::Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        ScaleSample,
+        SCALE_CHANNEL_SIZE,
+    >,
     state_sender: watch::Sender<
         'static,
         CriticalSectionRawMutex,
@@ -544,30 +638,41 @@ pub async fn controller_task(
     };
 
     loop {
-        let raw_weight = scale_receiver.receive().await;
-        let (event, weight, coffee_weight, target_weight) = {
+        let (time, raw_weight) = scale_receiver.receive().await;
+        let (event, weight, coffee_weight, target_weight, estimate) = {
             let mut grinder_state_machine_guard = grinder_state_machine.lock().await;
-            grinder_state_machine_guard.update_weight(raw_weight);
+            grinder_state_machine_guard.update_weight(time, raw_weight);
             let event = grinder_state_machine_guard.as_user_event();
             let weight = grinder_state_machine_guard
                 .scale_setting
                 .translate(raw_weight);
             let coffee_weight = grinder_state_machine_guard.get_coffee_weight(weight);
             let target_weight = grinder_state_machine_guard.get_target_weight();
-            (event, weight, coffee_weight, target_weight)
+            let estimate = grinder_state_machine_guard.grind_estimate();
+            (event, weight, coffee_weight, target_weight, estimate)
         };
+        let filtered_weight = estimate.map(|(filtered_weight, _)| filtered_weight);
+        let eta = estimate.and_then(|(_, eta)| eta).map(EtaReading::from);
         // Sent before the state so the LED strip never picks up a stale
         // progress from the previous grind when grinding starts.
-        if let (UserEvent::Grinding, Some(coffee_weight)) = (event, coffee_weight) {
-            grind_progress_sender.send((coffee_weight / target_weight).clamp(0.0, 1.0));
+        if let (UserEvent::Grinding, Some(progress_weight)) =
+            (event, filtered_weight.or(coffee_weight))
+        {
+            grind_progress_sender.send((progress_weight / target_weight).clamp(0.0, 1.0));
         }
         if event != last_event {
             last_event = event;
             state_sender.send(event);
         }
 
-        let reading =
-            WeightReading::new(Instant::now().as_millis(), weight, event, coffee_weight);
+        let reading = WeightReading::new(
+            time.as_millis(),
+            weight,
+            event,
+            coffee_weight,
+            filtered_weight,
+            eta,
+        );
         weight_sender.try_send(reading).ok();
     }
 }

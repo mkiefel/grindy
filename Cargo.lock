@@ -827,6 +827,7 @@ dependencies = [
  "embassy-rp",
  "embassy-sync",
  "embassy-time",
+ "grindy-gp",
  "heapless 0.9.1",
  "loadcell",
  "num-traits",

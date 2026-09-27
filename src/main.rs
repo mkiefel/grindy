@@ -30,8 +30,8 @@ mod web;
 mod wifi;
 
 use crate::scale::{
-    controller_task, scale_task, GrinderStateMachine, WeightReading, SCALE_CHANNEL_SIZE,
-    WEIGHT_CHANNEL_SIZE,
+    controller_task, scale_task, GrinderStateMachine, ScaleSample, WeightReading,
+    SCALE_CHANNEL_SIZE, WEIGHT_CHANNEL_SIZE,
 };
 use crate::storage::{FlashStorage, SharedFlash};
 use crate::ui::{
@@ -144,7 +144,7 @@ async fn main(spawner: Spawner) {
     let dt = Input::new(p.PIN_18, Pull::Down);
     let sck = Output::new(p.PIN_19, Level::Low);
 
-    static SCALE_CHANNEL: channel::Channel<CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE> =
+    static SCALE_CHANNEL: channel::Channel<CriticalSectionRawMutex, ScaleSample, SCALE_CHANNEL_SIZE> =
         channel::Channel::new();
     spawner.must_spawn(scale_task(sck, dt, SCALE_CHANNEL.sender()));
 
