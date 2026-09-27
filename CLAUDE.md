@@ -44,8 +44,9 @@ cargo test-gp -- --nocapture
 Runs the host tests of the `grindy-gp` crate (a cargo alias for `cargo test
 -p grindy-gp --target host-tuple`, since `.cargo/config.toml` pins the
 default build target to the MCU): the GP estimator's invariants, its
-equivalence with a batch-GP reference, and a replay regression over the logs
-in `logs/`.
+equivalence with a batch-GP reference, and a replay regression over the
+fixtures committed in `grindy-gp/tests/data/` (exported from the grinds in
+`logs/`, which is gitignored).
 
 ```bash
 cd logger && uv run --with pytest pytest -q
@@ -73,7 +74,7 @@ The project uses **Embassy**, an async executor for embedded systems. All major 
 2. **net_task**: Manages the TCP/IP network stack
 3. **web_task** (pool of 8): HTTP server tasks handling status requests
 4. **scale_task**: Continuously reads HX711 load cell sensor (polls every 10 ms; the HX711 delivers ~11 samples/s)
-5. **led_task**: Controls onboard LED based on grinder state
+5. **led_strip_task**: Controls the addressable LED strip based on grinder state and grind progress
 6. **controller_task**: State machine managing the grinding workflow
 
 ### State Machine (GrinderStateMachine)
@@ -109,7 +110,7 @@ exceeds 0.01s, persisted to flash. Portafilter removal moves on to
 ### Communication Architecture
 
 - **scale_task → controller_task**: `channel::Channel<ScaleSample>` (size 5), where `ScaleSample = (Instant, f32)` is a raw weight reading timestamped at the HX711 read
-- **controller_task → led_task**: `watch::Watch<UserEvent>` for state broadcasts
+- **controller_task → led_strip_task / websocket_broadcaster_task / network_task**: `watch::Watch<UserEvent>` for state broadcasts (`network_task` uses it to blink the onboard CYW43 LED via `blink_status_led`)
 - **controller_task → led_strip_task**: `watch::Watch<f32>` grind progress (0..1, coffee/target weight, using the GP-filtered weight once available) while grinding; the strip switches green LEDs on one by one (with hysteresis against flicker)
 - **controller_task → websocket_broadcaster_task**: `channel::Channel<ControllerEvent>` (size 4); `ControllerEvent` is `Reading(WeightReading)` (one per scale sample) or `GrindFinished(GrindFinished)` (once per grind, once the settled weight has been measured or the grind was abandoned)
 - **websocket_broadcaster_task / web handlers → WebSocket clients**: `WsConnectionRegistry` broadcasts each `WsMessage` into a per-connection queue (`WS_QUEUES`, 16 messages each); a client that falls that far behind has messages dropped
@@ -150,7 +151,7 @@ sector follows the target-weight sector (magic `0x6772_7461`, "grta").
 ### Hardware Pins
 
 - **Grinder control**: GPIO 0 (active-low relay control)
-- **HX711 scale**: GPIO 16 (SCK), GPIO 17 (DT, pull-down)
+- **HX711 scale**: GPIO 19 (SCK), GPIO 18 (DT, pull-down)
 - **CYW43 WiFi**: PIO0 SPI interface (pins 23-25, 24, 29)
 
 ## Memory Layout
