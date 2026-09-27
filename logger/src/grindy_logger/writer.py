@@ -9,6 +9,7 @@ import pyarrow.parquet as pq
 
 from .models import (
     ConnectedMessage,
+    GrindFinishedMessage,
     ScaleSetting,
     StateChangeMessage,
     TargetWeightChangedMessage,
@@ -21,7 +22,7 @@ from .models import (
 SCHEMA = pa.schema([
     ("timestamp_ms", pa.uint64()),           # Device timestamp
     ("received_at", pa.float64()),           # Local Unix timestamp when received
-    ("message_type", pa.string()),           # "Connected" | "StateChange" | "WeightReading" | "TargetWeightChanged"
+    ("message_type", pa.string()),           # "Connected" | "StateChange" | "WeightReading" | "TargetWeightChanged" | "GrindFinished"
     ("state", pa.string()),                  # UserEvent as string
     ("weight", pa.float32()),                # Current weight (nullable)
     ("coffee_weight", pa.float32()),         # Coffee weight only (nullable)
@@ -29,6 +30,15 @@ SCHEMA = pa.schema([
     ("scale_inv_variance", pa.float32()),    # Scale calibration (nullable)
     ("scale_factor", pa.float32()),          # Scale calibration (nullable)
     ("target_weight", pa.float32()),         # Target coffee weight (nullable)
+    ("filtered_weight", pa.float32()),       # GP estimate of the coffee weight while grinding (nullable)
+    ("eta_median", pa.float32()),            # Seconds until the grinder stops, median (nullable)
+    ("eta_lo", pa.float32()),                # ... 10 % quantile (nullable)
+    ("eta_hi", pa.float32()),                # ... 90 % quantile (nullable)
+    ("lead_time", pa.float32()),             # Lead time in seconds (nullable)
+    ("stop_reason", pa.string()),            # "Prediction" | "RawWeight" | "Timeout" (GrindFinished only)
+    ("stop_weight", pa.float32()),           # Coffee weight when the grinder stopped (GrindFinished only)
+    ("settled_weight", pa.float32()),        # Settled coffee weight (GrindFinished only, nullable)
+    ("lead_time_observed", pa.float32()),    # Lead time observed in the grind (GrindFinished only, nullable)
 ])
 
 
@@ -70,6 +80,7 @@ class ArrowWriter:
                 state=message.state.name,
                 scale_setting=message.scale_setting,
                 target_weight=message.target_weight,
+                lead_time=message.lead_time,
             )
 
         elif isinstance(message, WeightMessage):
@@ -81,6 +92,10 @@ class ArrowWriter:
                 state=reading.state.name,
                 weight=reading.weight,
                 coffee_weight=reading.coffee_weight,
+                filtered_weight=reading.filtered_weight,
+                eta_median=reading.eta.median if reading.eta else None,
+                eta_lo=reading.eta.lo if reading.eta else None,
+                eta_hi=reading.eta.hi if reading.eta else None,
             )
 
         elif isinstance(message, TargetWeightChangedMessage):
@@ -90,6 +105,20 @@ class ArrowWriter:
                 message_type="TargetWeightChanged",
                 state=None,
                 target_weight=message.target_weight,
+            )
+
+        elif isinstance(message, GrindFinishedMessage):
+            # Carries no device timestamp; reuse the last one seen.
+            self._add_record(
+                timestamp_ms=self.last_timestamp_ms,
+                received_at=received_at,
+                message_type="GrindFinished",
+                state=None,
+                stop_reason=message.stop_reason.name,
+                stop_weight=message.stop_weight,
+                settled_weight=message.settled_weight,
+                lead_time_observed=message.lead_time_observed,
+                lead_time=message.lead_time,
             )
 
         # Flush if batch is full
@@ -102,25 +131,28 @@ class ArrowWriter:
         received_at: float,
         message_type: str,
         state: Optional[str],
-        weight: Optional[float] = None,
-        coffee_weight: Optional[float] = None,
         scale_setting: Optional[ScaleSetting] = None,
-        target_weight: Optional[float] = None,
+        **fields,
     ) -> None:
-        """Add a single record to the batch."""
+        """Add a single record to the batch; columns not given are null."""
+        unknown = set(fields) - set(SCHEMA.names)
+        assert not unknown, f"unknown columns {unknown}"
         self.last_timestamp_ms = max(self.last_timestamp_ms, timestamp_ms)
-        self.batch.append({
-            "timestamp_ms": timestamp_ms,
-            "received_at": received_at,
-            "message_type": message_type,
-            "state": state,
-            "weight": weight,
-            "coffee_weight": coffee_weight,
-            "scale_offset": scale_setting.offset if scale_setting else None,
-            "scale_inv_variance": scale_setting.inv_variance if scale_setting else None,
-            "scale_factor": scale_setting.factor if scale_setting else None,
-            "target_weight": target_weight,
-        })
+        record = dict.fromkeys(SCHEMA.names)
+        record.update(
+            timestamp_ms=timestamp_ms,
+            received_at=received_at,
+            message_type=message_type,
+            state=state,
+            **fields,
+        )
+        if scale_setting:
+            record.update(
+                scale_offset=scale_setting.offset,
+                scale_inv_variance=scale_setting.inv_variance,
+                scale_factor=scale_setting.factor,
+            )
+        self.batch.append(record)
 
     def flush(self) -> None:
         """Write batched records to Parquet file."""

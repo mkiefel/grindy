@@ -62,14 +62,23 @@ Data is saved in Parquet format with the following schema:
 |--------|------|-------------|
 | `timestamp_ms` | uint64 | Microcontroller timestamp in milliseconds |
 | `received_at` | float64 | Local Unix timestamp when message was received |
-| `message_type` | string | "Connected", "StateChange", "WeightReading", or "TargetWeightChanged" |
-| `state` | string | Grinder state: "Initializing", "Idle", "Stabilizing", "Grinding", "WaitingForRemoval", "WaitingForCalibration", "Calibrating" (null for "TargetWeightChanged") |
+| `message_type` | string | "Connected", "StateChange", "WeightReading", "TargetWeightChanged", or "GrindFinished" |
+| `state` | string | Grinder state: "Initializing", "Idle", "Stabilizing", "Grinding", "WaitingForRemoval", "WaitingForCalibration", "Calibrating" (null for "TargetWeightChanged" and "GrindFinished") |
 | `weight` | float32 | Total weight on scale (nullable) |
 | `coffee_weight` | float32 | Coffee weight only (nullable) |
 | `scale_offset` | float32 | Scale calibration offset (nullable) |
 | `scale_inv_variance` | float32 | Inverse variance of scale (nullable) |
 | `scale_factor` | float32 | Scale calibration factor (nullable) |
 | `target_weight` | float32 | Target coffee weight in grams (nullable) |
+| `filtered_weight` | float32 | GP estimate of the coffee weight while grinding (nullable) |
+| `eta_median` | float32 | Seconds until the grinder stops, median (nullable) |
+| `eta_lo` | float32 | Seconds until the grinder stops, 10 % quantile (nullable) |
+| `eta_hi` | float32 | Seconds until the grinder stops, 90 % quantile (nullable) |
+| `lead_time` | float32 | Lead time in seconds (nullable) |
+| `stop_reason` | string | "Prediction", "RawWeight", or "Timeout" (GrindFinished only) |
+| `stop_weight` | float32 | Coffee weight when the grinder stopped (GrindFinished only) |
+| `settled_weight` | float32 | Settled coffee weight (GrindFinished only, nullable) |
+| `lead_time_observed` | float32 | Lead time observed in the grind (GrindFinished only, nullable) |
 
 ### Timestamp Ordering
 
@@ -118,12 +127,13 @@ grinding.select([
 
 ## Message Types
 
-The WebSocket sends four types of messages:
+The WebSocket sends five types of messages:
 
-1. **Connected**: Sent immediately on connection with current state, scale calibration and target weight
-2. **StateChange**: Sent when grinder state transitions (Idle → Stabilizing → Grinding → WaitingForRemoval), with scale calibration and target weight
-3. **Weight**: Sent for every scale sample with one weight reading
+1. **Connected**: Sent immediately on connection with current state, scale calibration, target weight, and lead time
+2. **StateChange**: Sent when grinder state transitions (Idle → Stabilizing → Grinding → WaitingForRemoval), with scale calibration, target weight, and lead time
+3. **Weight**: Sent for every scale sample with one weight reading, including the GP's filtered weight and ETA estimate (when available)
 4. **TargetWeightChanged**: Sent when the target weight is changed from the web page. It carries no device timestamp, so its row reuses the latest `timestamp_ms` seen before it
+5. **GrindFinished**: Sent once per grind after the weight settled (or the portafilter was removed first): why the grinder stopped, the stop and settled coffee weights, and the observed and learned lead time. Like TargetWeightChanged it carries no device timestamp
 
 ## Troubleshooting
 

@@ -19,6 +19,21 @@ class UserEvent(IntEnum):
     Calibrating = 6
 
 
+class StopReason(IntEnum):
+    """Why the grinder stopped, matching the Rust StopReason enum."""
+    Prediction = 0
+    RawWeight = 1
+    Timeout = 2
+
+
+@dataclass
+class Eta:
+    """Seconds until the grinder is expected to stop (50/10/90 % quantiles)."""
+    median: float
+    lo: float
+    hi: float
+
+
 @dataclass
 class ScaleSetting:
     """Scale calibration settings."""
@@ -34,6 +49,8 @@ class WeightReading:
     weight: float
     state: UserEvent
     coffee_weight: Optional[float]
+    filtered_weight: Optional[float]
+    eta: Optional[Eta]
 
 
 @dataclass
@@ -43,6 +60,7 @@ class ConnectedMessage:
     scale_setting: ScaleSetting
     target_weight: float
     timestamp_ms: int
+    lead_time: float
 
 
 @dataclass
@@ -52,6 +70,7 @@ class StateChangeMessage:
     scale_setting: ScaleSetting
     target_weight: float
     timestamp_ms: int
+    lead_time: float
 
 
 @dataclass
@@ -66,9 +85,19 @@ class TargetWeightChangedMessage:
     target_weight: float
 
 
+@dataclass
+class GrindFinishedMessage:
+    """Summary of a finished grind, sent once the weight settled."""
+    stop_reason: StopReason
+    stop_weight: float
+    settled_weight: Optional[float]
+    lead_time_observed: Optional[float]
+    lead_time: float
+
+
 # Union type for all possible WebSocket messages
 WsMessage = Union[
-    ConnectedMessage, StateChangeMessage, WeightMessage, TargetWeightChangedMessage
+    ConnectedMessage, StateChangeMessage, WeightMessage, TargetWeightChangedMessage, GrindFinishedMessage
 ]
 
 class PostcardDecoder:
@@ -116,13 +145,19 @@ class PostcardDecoder:
             factor=self.read_f32()
         )
 
+    def read_eta(self) -> Eta:
+        """Decode EtaReading struct."""
+        return Eta(median=self.read_f32(), lo=self.read_f32(), hi=self.read_f32())
+
     def read_weight_reading(self) -> WeightReading:
         """Decode WeightReading struct."""
         return WeightReading(
             timestamp_ms=self.read_varint(),
             weight=self.read_f32(),
             state=self.read_user_event(),
-            coffee_weight=self.read_option(self.read_f32)
+            coffee_weight=self.read_option(self.read_f32),
+            filtered_weight=self.read_option(self.read_f32),
+            eta=self.read_option(self.read_eta)
         )
 
     def read_ws_message(self) -> WsMessage:
@@ -135,6 +170,7 @@ class PostcardDecoder:
                 scale_setting=self.read_scale_setting(),
                 target_weight=self.read_f32(),
                 timestamp_ms=self.read_varint(),
+                lead_time=self.read_f32(),
             )
         elif variant == 1:
             return StateChangeMessage(
@@ -142,11 +178,20 @@ class PostcardDecoder:
                 scale_setting=self.read_scale_setting(),
                 target_weight=self.read_f32(),
                 timestamp_ms=self.read_varint(),
+                lead_time=self.read_f32(),
             )
         elif variant == 2:
             return WeightMessage(reading=self.read_weight_reading())
         elif variant == 3:
             return TargetWeightChangedMessage(target_weight=self.read_f32())
+        elif variant == 4:
+            return GrindFinishedMessage(
+                stop_reason=StopReason(self.read_varint()),
+                stop_weight=self.read_f32(),
+                settled_weight=self.read_option(self.read_f32),
+                lead_time_observed=self.read_option(self.read_f32),
+                lead_time=self.read_f32(),
+            )
         else:
             raise ValueError(f"Unknown WsMessage variant: {variant}")
 
@@ -158,6 +203,6 @@ def parse_message(data: bytes) -> WsMessage:
         data: Binary postcard-encoded message
 
     Returns:
-        Parsed message (Connected, StateChange, Weight, or TargetWeightChanged)
+        Parsed message (Connected, StateChange, Weight, TargetWeightChanged, or GrindFinished)
     """
     return PostcardDecoder(data).read_ws_message()
