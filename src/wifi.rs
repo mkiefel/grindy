@@ -10,7 +10,7 @@ use crate::ui::{blink_status_led, UserEvent, USER_EVENT_CHANNEL_SIZE};
 /// Access point opened when no WiFi is configured or joining it failed.
 const SETUP_AP_SSID: &str = "grindy";
 const SETUP_AP_PASSWORD: &str = "grindyrockz";
-const SETUP_AP_CHANNEL: u8 = 8;
+const SETUP_AP_CHANNEL: u8 = 6;
 const SETUP_AP_ADDRESS: Ipv4Address = Ipv4Address::new(192, 168, 25, 1);
 
 /// Upper bound for a single join attempt. The cyw43 driver waits for the chip

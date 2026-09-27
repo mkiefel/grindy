@@ -93,12 +93,25 @@ pub async fn blink_status_led(
 
 const NUM_LEDS: usize = 6;
 
+/// Upper bound for each color channel of the LED strip. Keeps the current draw
+/// low so the strip does not pull the supply down (and with it the WiFi chip).
+const MAX_BRIGHTNESS: u8 = 16;
+
+async fn write_led_strip(
+    ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LEDS>,
+    data: &[RGB8; NUM_LEDS],
+) {
+    let scale = |c: u8| ((c as u16 * MAX_BRIGHTNESS as u16) / 255) as u8;
+    let scaled = data.map(|c| RGB8::new(scale(c.r), scale(c.g), scale(c.b)));
+    ws2812.write(&scaled).await;
+}
+
 async fn show_initializing_led_strip(ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LEDS>) {
     let mut data = [RGB8::default(); NUM_LEDS];
     for i in 0..NUM_LEDS {
         data[i] = RGB8::new(0, 0, 255);
     }
-    ws2812.write(&data).await;
+    write_led_strip(ws2812, &data).await;
     future::pending().await
 }
 
@@ -112,7 +125,7 @@ async fn show_idle_led_strip(ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LEDS>)
                 data[i] = wheel((((i * 256) as u16 / NUM_LEDS as u16 + j as u16) & 255) as u8);
             }
 
-            ws2812.write(&data).await;
+            write_led_strip(ws2812, &data).await;
             ticker.next().await;
         }
     }
@@ -123,7 +136,7 @@ async fn show_stabilizing_led_strip(ws2812: &mut PioWs2812<'static, PIO1, 0, NUM
     for i in 0..NUM_LEDS {
         data[i] = RGB8::new(255, 255, 0);
     }
-    ws2812.write(&data).await;
+    write_led_strip(ws2812, &data).await;
     future::pending().await
 }
 
@@ -132,7 +145,7 @@ async fn show_grinding_led_strip(ws2812: &mut PioWs2812<'static, PIO1, 0, NUM_LE
     for i in 0..NUM_LEDS {
         data[i] = RGB8::new(0, 255, 0);
     }
-    ws2812.write(&data).await;
+    write_led_strip(ws2812, &data).await;
     future::pending().await
 }
 
@@ -147,7 +160,7 @@ async fn show_pulsing_led_strip(
             for i in 0..NUM_LEDS {
                 data[i] = color(brightness);
             }
-            ws2812.write(&data).await;
+            write_led_strip(ws2812, &data).await;
             Timer::after(Duration::from_millis(10)).await;
         }
     }
