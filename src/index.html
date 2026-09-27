@@ -75,6 +75,16 @@ button:disabled{opacity:0.4;cursor:not-allowed}
 <div class="metric-label">percent</div>
 </div>
 <div class="metric">
+<div class="metric-label">Stops in</div>
+<div class="metric-value" id="eta">--</div>
+<div class="metric-label" id="eta-range">seconds</div>
+</div>
+<div class="metric">
+<div class="metric-label">Lead time</div>
+<div class="metric-value" id="lead-time">--</div>
+<div class="metric-label">seconds</div>
+</div>
+<div class="metric">
 <div class="metric-label">Calibration offset</div>
 <div class="metric-value" id="scale-offset">--</div>
 <div class="metric-label">raw grams</div>
@@ -101,22 +111,6 @@ button:disabled{opacity:0.4;cursor:not-allowed}
 <polyline id="chart-line" class="chart-line" points=""></polyline>
 </svg>
 <p id="chart-summary" class="chart-summary">No grind recorded yet.</p>
-</div>
-
-<div class="card">
-<h2 style="margin-bottom:1rem">Metrics</h2>
-<div class="grid">
-<div class="metric">
-<div class="metric-label">Stops in</div>
-<div class="metric-value" id="eta">--</div>
-<div class="metric-label" id="eta-range">seconds</div>
-</div>
-<div class="metric">
-<div class="metric-label">Lead time</div>
-<div class="metric-value" id="lead-time">--</div>
-<div class="metric-label">seconds</div>
-</div>
-</div>
 </div>
 
 <div class="card">
