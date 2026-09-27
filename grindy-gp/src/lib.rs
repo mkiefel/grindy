@@ -9,6 +9,7 @@
 
 mod estimator;
 mod fitted;
+pub mod lead_time;
 
 pub use estimator::{Eta, Gaussian, GrindEstimator, Params, MAX_ETA};
 pub use fitted::{DEFAULT_LEAD_TIME, FITTED};
