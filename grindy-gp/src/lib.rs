@@ -8,5 +8,11 @@
 #![cfg_attr(not(test), no_std)]
 
 mod estimator;
+mod fitted;
 
 pub use estimator::{Gaussian, GrindEstimator, Params};
+pub use fitted::{DEFAULT_LEAD_TIME, FITTED};
+
+/// Seconds after the grinder starts before readings go into the estimator.
+/// The flow only ramps up in that time, which would bias the rate low.
+pub const RAMP_UP: f32 = 1.0;
