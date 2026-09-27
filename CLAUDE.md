@@ -72,7 +72,7 @@ The project uses **Embassy**, an async executor for embedded systems. All major 
 1. **cyw43_task**: Runs the WiFi chip driver (CYW43439) for network connectivity
 2. **net_task**: Manages the TCP/IP network stack
 3. **web_task** (pool of 8): HTTP server tasks handling status requests
-4. **scale_task**: Continuously reads HX711 load cell sensor (~100Hz polling)
+4. **scale_task**: Continuously reads HX711 load cell sensor (polls every 10 ms; the HX711 delivers ~11 samples/s)
 5. **led_task**: Controls onboard LED based on grinder state
 6. **controller_task**: State machine managing the grinding workflow
 
@@ -179,8 +179,9 @@ In `src/scale.rs` (`GrinderStateMachine` and its `update_weight()`):
   `POST /target-weight` from the web page and stored in flash (sector after the WiFi one)
 - `PORTAFILTER_THRESHOLD`: 100.0g (detection threshold)
 - `REMOVAL_THRESHOLD`: 10.0g
-- Stabilizing window: `SAMPLE_COUNT` = 15 samples (~2s at ~100Hz), stable within
-  `stability_threshold()` (3 sd of the scale noise) of their mean
+- Stabilizing window: `SAMPLE_COUNT` = 15 samples (~1.4s at the HX711's
+  ~11 samples/s), stable within `stability_threshold()` (3 sd of the scale
+  noise) of their mean
 - `MAX_GRIND_TIME_IN_SECS`: 50s (safety timeout)
 - Settle window (`SETTLE_START`/`SETTLE_END`): 1.5-2.5s after the grind stops,
   used to measure the settled weight and learn the lead time
