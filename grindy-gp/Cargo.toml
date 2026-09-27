@@ -1,0 +1,8 @@
+[package]
+name = "grindy-gp"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+libm = "0.2"

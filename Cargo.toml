@@ -38,3 +38,6 @@ bench = false
 [profile.release]
 # Enable generation of debug symbols even on release builds
 debug = true
+
+[workspace]
+members = [".", "grindy-gp"]

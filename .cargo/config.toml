@@ -6,3 +6,7 @@ target = "thumbv8m.main-none-eabihf"
 
 [env]
 DEFMT_LOG = "debug"
+
+[alias]
+# The build target above is the MCU; grindy-gp's tests run on the host.
+test-gp = "test -p grindy-gp --target host-tuple"
