@@ -2,7 +2,7 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type, core_float_math)]
 
-use cyw43::{JoinOptions, NetDriver};
+use cyw43::NetDriver;
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
@@ -26,7 +26,7 @@ use crate::scale::{
     controller_task, scale_task, GrinderStateMachine, WeightReading, SCALE_CHANNEL_SIZE,
     WEIGHT_BATCH_CHANNEL_SIZE,
 };
-use crate::ui::{led_strip_task, led_task, UserEvent, USER_EVENT_CHANNEL_SIZE};
+use crate::ui::{join_wifi, led_strip_task, wifi_task, UserEvent, USER_EVENT_CHANNEL_SIZE};
 use crate::web::{
     bringup_web_server, websocket_broadcaster_task, WsConnectionRegistry, WEB_TASK_POOL_SIZE,
 };
@@ -67,7 +67,7 @@ fn bringup_network_stack(
         net_device,
         embassy_net::Config::dhcpv4(Default::default()),
         make_static!(
-            embassy_net::StackResources::<WEB_TASK_POOL_SIZE>,
+            embassy_net::StackResources::<{ WEB_TASK_POOL_SIZE + 1 }>,
             embassy_net::StackResources::new()
         ),
         embassy_rp::clocks::RoscRng.next_u64(),
@@ -120,23 +120,15 @@ async fn main(spawner: Spawner) {
 
     let stack = bringup_network_stack(&spawner, net_device);
 
-    while let Err(err) = control
-        .join(
-            env!("GRINDY_WIFI_SSID"),
-            JoinOptions::new(env!("GRINDY_WIFI_PASSWORD").as_bytes()),
-        )
-        .await
-    {
-        info!("Join failed with status: {}", err.status)
-    }
+    let wifi_connected = join_wifi(
+        &mut control,
+        stack,
+        env!("GRINDY_WIFI_SSID"),
+        env!("GRINDY_WIFI_PASSWORD"),
+    )
+    .await;
 
-    info!("Waiting for link...");
-    stack.wait_link_up().await;
-
-    info!("Waiting for config...");
-    stack.wait_config_up().await;
-
-    info!("Stack is up.");
+    spawner.must_spawn(wifi_task(control, unwrap!(STATE_WATCH.receiver())));
 
     let grinder = Output::new(p.PIN_0, Level::High);
 
@@ -146,8 +138,6 @@ async fn main(spawner: Spawner) {
     static SCALE_CHANNEL: channel::Channel<CriticalSectionRawMutex, f32, SCALE_CHANNEL_SIZE> =
         channel::Channel::new();
     spawner.must_spawn(scale_task(sck, dt, SCALE_CHANNEL.sender()));
-
-    spawner.must_spawn(led_task(control, unwrap!(STATE_WATCH.receiver())));
 
     static GRINDER_STATE_MACHINE: StaticCell<
         mutex::Mutex<CriticalSectionRawMutex, GrinderStateMachine>,
@@ -171,7 +161,11 @@ async fn main(spawner: Spawner) {
         ws_registry,
     ));
 
-    bringup_web_server(&spawner, stack, &grinder_state_machine, ws_registry);
+    if wifi_connected {
+        bringup_web_server(&spawner, stack, grinder_state_machine, ws_registry);
+    } else {
+        warn!("WiFi not connected; skipping web server bringup");
+    }
 
     info!("Hello, coffee world!");
     controller_task(
