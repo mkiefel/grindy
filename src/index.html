@@ -34,6 +34,12 @@ button:disabled{opacity:0.4;cursor:not-allowed}
 .metric-label{opacity:0.8;font-size:0.9rem}
 .logs{background:rgba(0,0,0,0.3);border-radius:0.5rem;padding:1rem;font-family:monospace;font-size:0.85rem;max-height:200px;overflow-y:auto;line-height:1.6}
 .log-entry{margin-bottom:0.25rem;opacity:0.9}
+.chart{width:100%;height:auto;display:block}
+.chart-grid{stroke:rgba(255,255,255,0.15);stroke-width:1}
+.chart-label{fill:rgba(255,255,255,0.7);font-size:12px}
+.chart-target{stroke:#4ade80;stroke-width:1.5;stroke-dasharray:6 4}
+.chart-line{fill:none;stroke:#f97316;stroke-width:2.5;stroke-linejoin:round;stroke-linecap:round}
+.chart-summary{opacity:0.8;font-size:0.9rem;text-align:center;margin-top:0.5rem}
 #status-msg{opacity:0.7;font-size:0.9rem;text-align:center;margin-top:0.5rem}
 </style>
 </head>
@@ -84,6 +90,17 @@ button:disabled{opacity:0.4;cursor:not-allowed}
 <div class="metric-label">grams</div>
 </div>
 </div>
+</div>
+
+<div class="card">
+<h2 style="margin-bottom:1rem">Grind Progress</h2>
+<svg id="grind-chart" class="chart" viewBox="0 0 600 240" role="img" aria-label="Coffee weight over time during the last grind">
+<g id="chart-grid"></g>
+<line id="chart-target" class="chart-target" x1="40" x2="590" y1="0" y2="0" visibility="hidden"></line>
+<text id="chart-target-label" class="chart-label" x="588" y="0" text-anchor="end" visibility="hidden"></text>
+<polyline id="chart-line" class="chart-line" points=""></polyline>
+</svg>
+<p id="chart-summary" class="chart-summary">No grind recorded yet.</p>
 </div>
 
 <div class="card">

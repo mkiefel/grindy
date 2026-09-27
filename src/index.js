@@ -216,6 +216,7 @@ function setTargetWeight(weight) {
   if (document.activeElement !== input && (changed || !input.value)) {
     input.value = weight.toFixed(1);
   }
+  if (changed) drawGrindChart();
 }
 
 async function saveTargetWeight(event) {
@@ -346,8 +347,112 @@ function updateUI(status, weight = null, progress = null, scaleSetting = null) {
   }
 }
 
+// Coffee weight over time for the current (or last) grind, plotted in the Grind Progress card.
+const CHART = { left: 40, right: 590, top: 10, bottom: 215 };
+const CHART_MIN_POINT_INTERVAL_MS = 50;
+// How long to keep recording after grinding stopped so the chart shows the settled weight.
+const CHART_TAIL_MS = 3000;
+let grindTrace = null;
+
+function niceStep(range, maxTicks) {
+  const raw = range / maxTicks;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 5, 10]) {
+    if (m * magnitude >= raw) return m * magnitude;
+  }
+  return 10 * magnitude;
+}
+
+function svgElement(name, attrs, text) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', name);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+
+function recordGrindReading(reading) {
+  const recording = reading.state === 'Grinding' || reading.state === 'WaitingForRemoval';
+  if (!recording || reading.coffeeWeight === null) {
+    if (grindTrace) grindTrace.active = false;
+    return false;
+  }
+  if (reading.state === 'Grinding' && !(grindTrace && grindTrace.active)) {
+    grindTrace = { startMs: reading.timestampMs, endMs: null, points: [], active: true };
+  }
+  if (!grindTrace || !grindTrace.active) return false;
+
+  if (reading.state === 'WaitingForRemoval') {
+    if (grindTrace.endMs === null) grindTrace.endMs = reading.timestampMs;
+    if (reading.timestampMs - grindTrace.endMs > CHART_TAIL_MS) {
+      grindTrace.active = false;
+      return false;
+    }
+  }
+  const points = grindTrace.points;
+  const last = points[points.length - 1];
+  if (last && reading.timestampMs - last.ms < CHART_MIN_POINT_INTERVAL_MS) return false;
+  points.push({ ms: reading.timestampMs, weight: reading.coffeeWeight });
+  return true;
+}
+
+function drawGrindChart() {
+  if (!grindTrace || grindTrace.points.length === 0) return;
+  const points = grindTrace.points;
+  const target = targetWeight || 18.0;
+  const lastPoint = points[points.length - 1];
+  const duration = (lastPoint.ms - grindTrace.startMs) / 1000;
+
+  const maxWeight = Math.max(target * 1.1, ...points.map(p => p.weight));
+  const minWeight = Math.min(0, ...points.map(p => p.weight));
+  const yStep = niceStep(maxWeight - minWeight, 5);
+  const yMin = Math.floor(minWeight / yStep) * yStep;
+  const yMax = Math.ceil(maxWeight / yStep) * yStep;
+  const xStep = niceStep(Math.max(duration, 5), 6);
+  const xMax = Math.max(Math.ceil(duration / xStep) * xStep, xStep);
+
+  const x = s => CHART.left + (s / xMax) * (CHART.right - CHART.left);
+  const y = g => CHART.bottom - ((g - yMin) / (yMax - yMin)) * (CHART.bottom - CHART.top);
+
+  const grid = document.getElementById('chart-grid');
+  grid.replaceChildren();
+  for (let g = yMin; g <= yMax + yStep / 2; g += yStep) {
+    grid.appendChild(svgElement('line', { class: 'chart-grid', x1: CHART.left, x2: CHART.right, y1: y(g), y2: y(g) }));
+    grid.appendChild(svgElement('text', { class: 'chart-label', x: CHART.left - 6, y: y(g) + 4, 'text-anchor': 'end' }, `${+g.toFixed(1)}`));
+  }
+  for (let s = 0; s <= xMax + xStep / 2; s += xStep) {
+    grid.appendChild(svgElement('text', { class: 'chart-label', x: x(s), y: CHART.bottom + 17, 'text-anchor': 'middle' }, `${+s.toFixed(1)}s`));
+  }
+
+  const targetLine = document.getElementById('chart-target');
+  targetLine.setAttribute('y1', y(target));
+  targetLine.setAttribute('y2', y(target));
+  targetLine.setAttribute('visibility', 'visible');
+  const targetLabel = document.getElementById('chart-target-label');
+  targetLabel.setAttribute('y', y(target) - 5);
+  targetLabel.textContent = `target ${target.toFixed(1)} g`;
+  targetLabel.setAttribute('visibility', 'visible');
+
+  document.getElementById('chart-line').setAttribute('points', points
+    .map(p => `${x((p.ms - grindTrace.startMs) / 1000).toFixed(1)},${y(p.weight).toFixed(1)}`)
+    .join(' '));
+
+  const summary = document.getElementById('chart-summary');
+  if (grindTrace.endMs === null) {
+    summary.textContent = `Grinding... ${lastPoint.weight.toFixed(1)} g after ${duration.toFixed(1)} s`;
+  } else {
+    const grindTime = (grindTrace.endMs - grindTrace.startMs) / 1000;
+    summary.textContent = `Last grind: ${lastPoint.weight.toFixed(1)} g in ${grindTime.toFixed(1)} s`;
+  }
+}
+
 function handleWeightBatch(readings) {
   if (readings && readings.length > 0) {
+    let chartChanged = false;
+    for (const reading of readings) {
+      if (recordGrindReading(reading)) chartChanged = true;
+    }
+    if (chartChanged) drawGrindChart();
+
     // Use the most recent reading
     const latest = readings[readings.length - 1];
 
