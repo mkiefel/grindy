@@ -140,7 +140,10 @@ calibration sector, see `src/storage.rs`) and set via `POST /wifi` from the web 
 - On boot, joins the stored network using DHCP.
 - If nothing is stored or joining fails: opens the setup AP "grindy" (password
   "grindyrockz", channel 6) with static IP 192.168.25.1/24 (no DHCP server;
-  clients need a static IP in 192.168.25.0/24).
+  clients need a static IP in 192.168.25.0/24). After a failed join, the
+  board reboots (flag in watchdog scratch 0) and opens the AP on a fresh chip:
+  the join leaves WPA3/SAE settings behind that `start_ap_wpa2` doesn't reset,
+  which makes clients fail with an encryption mismatch (`EVENT PRUNE`, reason 1).
 - Saving new credentials stores them and makes `network_task` reconnect.
 - `GET /wifi` returns the current mode and SSID as JSON.
 

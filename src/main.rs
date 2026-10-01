@@ -13,6 +13,7 @@ use embassy_rp::gpio::{self, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, PIO1};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
+use embassy_rp::watchdog::Watchdog;
 use embassy_sync::{
     blocking_mutex::{self, raw::CriticalSectionRawMutex},
     channel, mutex, watch,
@@ -180,6 +181,7 @@ async fn main(spawner: Spawner) {
         control,
         stack,
         flash,
+        Watchdog::new(p.WATCHDOG),
         unwrap!(STATE_WATCH.receiver()),
     ));
     bringup_web_server(&spawner, stack, grinder_state_machine, ws_registry, flash);

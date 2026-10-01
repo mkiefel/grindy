@@ -1,6 +1,7 @@
 use cyw43::{Control, JoinOptions};
 use defmt::*;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StaticConfigV4};
+use embassy_rp::watchdog::Watchdog;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex, signal, watch};
 use embassy_time::{with_timeout, Duration, Timer};
 
@@ -19,6 +20,12 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long to wait for a DHCP lease after joining a network.
 const DHCP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Watchdog scratch register that survives the reset in
+/// `reboot_into_setup_access_point`. Scratch 4-7 are used by the RP2350
+/// bootrom, so use one of the low ones.
+const FORCE_SETUP_AP_SCRATCH: usize = 0;
+const FORCE_SETUP_AP_MAGIC: u32 = 0x6772_6170; // "grap"
 
 /// Signalled with a new configuration (already stored in flash) to make the
 /// network task reconnect.
@@ -110,6 +117,19 @@ async fn start_setup_access_point(control: &mut Control<'static>, stack: Stack<'
         .await;
 }
 
+/// Reboots straight into the setup access point. A failed join leaves the
+/// chip configured for WPA3/SAE (auth mode, MFP, supplicant), which
+/// `start_ap_wpa2` doesn't reset, so clients are rejected with an encryption
+/// mismatch. Starting the AP on a freshly initialised chip avoids that.
+fn reboot_into_setup_access_point(watchdog: &mut Watchdog) -> ! {
+    warn!("Rebooting into the setup access point");
+    watchdog.set_scratch(FORCE_SETUP_AP_SCRATCH, FORCE_SETUP_AP_MAGIC);
+    watchdog.trigger_reset();
+    loop {
+        cortex_m::asm::nop();
+    }
+}
+
 /// Connects to the WiFi stored in flash, falling back to the setup access
 /// point, and reconnects whenever a new configuration is set.
 #[embassy_executor::task]
@@ -117,6 +137,7 @@ pub async fn network_task(
     mut control: Control<'static>,
     stack: Stack<'static>,
     flash: SharedFlash,
+    mut watchdog: Watchdog,
     mut state_receiver: watch::Receiver<
         'static,
         CriticalSectionRawMutex,
@@ -125,12 +146,21 @@ pub async fn network_task(
     >,
 ) {
     let mut config = flash.lock(|flash| storage::read_wifi_config(&mut flash.borrow_mut()));
+    // Consume the flag so that the next reboot tries joining again.
+    let mut force_setup_ap = watchdog.get_scratch(FORCE_SETUP_AP_SCRATCH) == FORCE_SETUP_AP_MAGIC;
+    watchdog.set_scratch(FORCE_SETUP_AP_SCRATCH, 0);
     loop {
         set_status(WifiMode::Connecting, config.as_ref()).await;
         let connected = match &config {
-            Some(config) => join_wifi(&mut control, stack, config).await,
-            None => false,
+            Some(config) if !force_setup_ap => {
+                if !join_wifi(&mut control, stack, config).await {
+                    reboot_into_setup_access_point(&mut watchdog);
+                }
+                true
+            }
+            _ => false,
         };
+        force_setup_ap = false;
         if connected {
             set_status(WifiMode::Client, config.as_ref()).await;
         } else {
