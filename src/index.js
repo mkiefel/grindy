@@ -224,39 +224,71 @@ function setTargetWeight(weight) {
   const changed = targetWeight !== weight;
   targetWeight = weight;
   document.getElementById('target-weight').textContent = weight.toFixed(1);
-  // Don't overwrite what the user is currently typing.
-  const input = document.getElementById('target-input');
-  if (document.activeElement !== input && (changed || !input.value)) {
-    input.value = weight.toFixed(1);
-  }
   if (changed) drawGrindChart();
 }
 
-async function saveTargetWeight(event) {
+const HOLDER_FIELDS = ['single-weight', 'single-target', 'double-weight', 'double-target'];
+
+async function loadHolders() {
+  try {
+    const response = await fetch('/holders');
+    if (!response.ok) return;
+    const holders = await response.json();
+    const values = {
+      'single-weight': holders.single.weight.toFixed(0),
+      'single-target': holders.single.target.toFixed(1),
+      'double-weight': holders.double.weight.toFixed(0),
+      'double-target': holders.double.target.toFixed(1),
+    };
+    for (const id of HOLDER_FIELDS) {
+      // Don't overwrite what the user is currently typing.
+      const input = document.getElementById(id);
+      if (document.activeElement !== input) input.value = values[id];
+    }
+  } catch (e) {
+    console.error('Loading holders failed', e);
+  }
+}
+
+async function saveHolders(event) {
   event.preventDefault();
-  const weight = parseFloat(document.getElementById('target-input').value);
-  const instructions = document.getElementById('target-instructions');
-  if (!(weight >= 1 && weight <= 100)) {
-    instructions.textContent = 'The target weight must be between 1 and 100 g.';
+  const [singleWeight, singleTarget, doubleWeight, doubleTarget] =
+    HOLDER_FIELDS.map(id => parseFloat(document.getElementById(id).value));
+  const instructions = document.getElementById('holders-instructions');
+  if (![singleWeight, doubleWeight].every(w => w >= 100 && w <= 2000)) {
+    instructions.textContent = 'Holder weights must be between 100 and 2000 g.';
+    return;
+  }
+  if (![singleTarget, doubleTarget].every(w => w >= 1 && w <= 100)) {
+    instructions.textContent = 'Target weights must be between 1 and 100 g.';
+    return;
+  }
+  if (singleWeight === doubleWeight) {
+    instructions.textContent = 'The holders need different weights to be told apart.';
     return;
   }
   try {
-    const response = await fetch('/target-weight', {
+    const response = await fetch('/holders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ weight }).toString(),
+      body: new URLSearchParams({
+        single_weight: singleWeight,
+        single_target: singleTarget,
+        double_weight: doubleWeight,
+        double_target: doubleTarget,
+      }).toString(),
     });
     const text = await response.text();
     if (!response.ok) {
-      instructions.textContent = `Saving target weight failed: ${text}`;
+      instructions.textContent = `Saving holders failed: ${text}`;
       return;
     }
     instructions.textContent = '';
-    document.getElementById('target-input').blur();
-    setTargetWeight(weight);
-    addLog(`Target weight set to ${weight.toFixed(1)} g`);
+    document.activeElement.blur();
+    addLog(`Holders set: single ${singleWeight} g → ${singleTarget.toFixed(1)} g, ` +
+      `double ${doubleWeight} g → ${doubleTarget.toFixed(1)} g`);
   } catch (e) {
-    instructions.textContent = `Saving target weight failed: ${e}`;
+    instructions.textContent = `Saving holders failed: ${e}`;
   }
 }
 
@@ -535,6 +567,7 @@ function handleMessage(arrayBuffer) {
       case 'connected':
         addLog('Connected to Grindy');
         setTargetWeight(msg.targetWeight);
+        loadHolders();
         setLeadTime(msg.leadTime);
         updateUI(msg.state, null, null, msg.scaleSetting);
         break;
@@ -548,6 +581,7 @@ function handleMessage(arrayBuffer) {
 
       case 'targetWeightChanged':
         setTargetWeight(msg.targetWeight);
+        loadHolders();
         break;
 
       case 'weight':
@@ -615,7 +649,7 @@ if (savedCalibrationWeight) document.getElementById('cal-weight').value = savedC
 document.getElementById('cal-weight').addEventListener('input', () => updateCalibrationUI(lastStatus));
 document.getElementById('cal-start').addEventListener('click', startCalibration);
 document.getElementById('cal-cancel').addEventListener('click', cancelCalibration);
-document.getElementById('target-form').addEventListener('submit', saveTargetWeight);
+document.getElementById('holders-form').addEventListener('submit', saveHolders);
 document.getElementById('wifi-form').addEventListener('submit', saveWifi);
 loadWifiStatus();
 connectWebSocket();

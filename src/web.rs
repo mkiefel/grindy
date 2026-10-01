@@ -11,10 +11,10 @@ use picoserve::{make_static, AppBuilder, AppRouter};
 use serde::{Deserialize, Serialize};
 
 use crate::scale::{
-    CalibrationError, ControllerEvent, GrindFinished, GrinderStateMachine, ScaleSetting,
-    TargetWeightError, WeightReading, CONTROLLER_EVENT_CHANNEL_SIZE,
+    CalibrationError, ControllerEvent, GrindFinished, GrinderStateMachine, HolderConfigError,
+    ScaleSetting, WeightReading, CONTROLLER_EVENT_CHANNEL_SIZE,
 };
-use crate::storage::{self, SharedFlash, WifiConfig};
+use crate::storage::{self, Holder, HolderConfig, SharedFlash, WifiConfig};
 use crate::ui::{UserEvent, USER_EVENT_CHANNEL_SIZE};
 use crate::wifi::{WifiMode, WIFI_CONFIG_CHANGED, WIFI_STATUS};
 
@@ -213,8 +213,11 @@ fn calibration_response(result: Result<(), CalibrationError>) -> (StatusCode, &'
 }
 
 #[derive(Deserialize)]
-struct TargetWeightForm {
-    weight: f32,
+struct HoldersForm {
+    single_weight: f32,
+    single_target: f32,
+    double_weight: f32,
+    double_target: f32,
 }
 
 #[derive(Deserialize)]
@@ -289,31 +292,54 @@ impl AppBuilder for AppProps {
                 }),
             )
             .route(
-                "/target-weight",
-                post(move |Form(TargetWeightForm { weight })| async move {
-                    let result = grinder_state_machine
-                        .lock()
-                        .await
-                        .set_target_weight(weight);
-                    match result {
-                        Ok(()) => {
-                            ws_registry
-                                .lock()
-                                .await
-                                .broadcast(&WsMessage::TargetWeightChanged {
-                                    target_weight: weight,
-                                });
-                            (StatusCode::OK, "OK")
+                "/holders",
+                get(move || async move {
+                    let config = *grinder_state_machine.lock().await.get_holder_config();
+                    picoserve::response::Json(config)
+                })
+                .post(
+                    move |Form(HoldersForm {
+                              single_weight,
+                              single_target,
+                              double_weight,
+                              double_target,
+                          })| async move {
+                        let config = HolderConfig {
+                            single: Holder {
+                                weight: single_weight,
+                                target: single_target,
+                            },
+                            double: Holder {
+                                weight: double_weight,
+                                target: double_target,
+                            },
+                        };
+                        let target_weight = {
+                            let mut grinder_state_machine = grinder_state_machine.lock().await;
+                            grinder_state_machine
+                                .set_holder_config(config)
+                                .map(|()| grinder_state_machine.get_target_weight())
+                        };
+                        match target_weight {
+                            Ok(target_weight) => {
+                                // Also tells other pages to reload the holders.
+                                ws_registry
+                                    .lock()
+                                    .await
+                                    .broadcast(&WsMessage::TargetWeightChanged { target_weight });
+                                (StatusCode::OK, "OK")
+                            }
+                            Err(HolderConfigError::OutOfRange) => (
+                                StatusCode::BAD_REQUEST,
+                                "Holder weights must be 100-2000 g and targets 1-100 g",
+                            ),
+                            Err(HolderConfigError::Storage) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Failed to store holders",
+                            ),
                         }
-                        Err(TargetWeightError::OutOfRange) => {
-                            (StatusCode::BAD_REQUEST, "Invalid target weight")
-                        }
-                        Err(TargetWeightError::Storage) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Failed to store target weight",
-                        ),
-                    }
-                }),
+                    },
+                ),
             )
             .route(
                 "/wifi",

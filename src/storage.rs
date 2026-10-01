@@ -4,6 +4,7 @@ use defmt::*;
 use embassy_rp::flash::{Blocking, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
 use embassy_sync::blocking_mutex::{self, raw::CriticalSectionRawMutex};
+use serde::Serialize;
 
 /// Physical flash size on the Pico 2 (RP2350). `memory.x` only lets the
 /// linker place the firmware image in the first 2 MiB of this, leaving the
@@ -32,6 +33,11 @@ const LEAD_TIME_OFFSET: u32 = TARGET_WEIGHT_OFFSET + ERASE_SIZE as u32;
 
 const LEAD_TIME_MAGIC: u32 = 0x6772_7461; // "grta"
 
+/// Offset of the portafilter holder sector, right after the lead time one.
+const HOLDERS_OFFSET: u32 = LEAD_TIME_OFFSET + ERASE_SIZE as u32;
+
+const HOLDERS_MAGIC: u32 = 0x6772_6870; // "grhp"
+
 pub const MAX_SSID_LEN: usize = 32;
 pub const MAX_PASSWORD_LEN: usize = 63;
 /// WPA2 passphrases have to be at least this long; an empty password means an
@@ -58,10 +64,40 @@ impl WifiConfig {
     }
 }
 
+/// A portafilter holder, told apart from the other one by its weight.
+#[derive(Clone, Copy, Serialize)]
+pub struct Holder {
+    /// Rough weight in grams of the empty holder.
+    pub weight: f32,
+    /// Coffee weight in grams to grind into this holder.
+    pub target: f32,
+}
+
+#[derive(Clone, Copy, Serialize)]
+pub struct HolderConfig {
+    pub single: Holder,
+    pub double: Holder,
+}
+
+/// Room for the magic plus up to 7 `f32`s stored with [`write_f32s`].
+const F32S_BUF_LEN: usize = 32;
+
 /// Reads an `f32` stored with [`write_f32`] at `offset`. Returns `None` if
 /// nothing has been stored yet (or the stored data is corrupt).
 fn read_f32(flash: &mut FlashStorage, offset: u32, magic: u32) -> Option<f32> {
-    let mut buf = [0u8; 8];
+    read_f32s::<1>(flash, offset, magic).map(|[value]| value)
+}
+
+/// Persists `value` in the sector at `offset` so it can be recovered with
+/// [`read_f32`]. Returns `false` if writing failed.
+fn write_f32(flash: &mut FlashStorage, offset: u32, magic: u32, value: f32) -> bool {
+    write_f32s(flash, offset, magic, &[value])
+}
+
+/// Reads `N` `f32`s stored with [`write_f32s`] at `offset`. Returns `None` if
+/// nothing has been stored yet (or the stored data is corrupt).
+fn read_f32s<const N: usize>(flash: &mut FlashStorage, offset: u32, magic: u32) -> Option<[f32; N]> {
+    let mut buf = [0u8; F32S_BUF_LEN];
     if let Err(err) = flash.blocking_read(offset, &mut buf) {
         warn!("Failed to read flash at {:#x}: {}", offset, err);
         return None;
@@ -70,21 +106,29 @@ fn read_f32(flash: &mut FlashStorage, offset: u32, magic: u32) -> Option<f32> {
     if u32::from_le_bytes(buf[0..4].try_into().unwrap()) != magic {
         return None;
     }
-    Some(f32::from_le_bytes(buf[4..8].try_into().unwrap()))
+    let mut values = [0.0; N];
+    for (value, chunk) in values.iter_mut().zip(buf[4..].chunks_exact(4)) {
+        *value = f32::from_le_bytes(chunk.try_into().unwrap());
+    }
+    Some(values)
 }
 
-/// Persists `value` in the sector at `offset` so it can be recovered with
-/// [`read_f32`]. Returns `false` if writing failed.
-fn write_f32(flash: &mut FlashStorage, offset: u32, magic: u32, value: f32) -> bool {
-    let mut buf = [0u8; 8];
+/// Persists `values` in the sector at `offset` so they can be recovered with
+/// [`read_f32s`]. Returns `false` if writing failed.
+fn write_f32s(flash: &mut FlashStorage, offset: u32, magic: u32, values: &[f32]) -> bool {
+    let mut buf = [0u8; F32S_BUF_LEN];
+    let len = 4 * (values.len() + 1);
     buf[0..4].copy_from_slice(&magic.to_le_bytes());
-    buf[4..8].copy_from_slice(&value.to_le_bytes());
+    for (chunk, value) in buf[4..len].chunks_exact_mut(4).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    let buf = &buf[..len];
 
     if let Err(err) = flash.blocking_erase(offset, offset + ERASE_SIZE as u32) {
         warn!("Failed to erase flash sector at {:#x}: {}", offset, err);
         return false;
     }
-    if let Err(err) = flash.blocking_write(offset, &buf) {
+    if let Err(err) = flash.blocking_write(offset, buf) {
         warn!("Failed to write flash at {:#x}: {}", offset, err);
         return false;
     }
@@ -111,25 +155,51 @@ pub fn write_calibration_factor(flash: &mut FlashStorage, factor: f32) {
     }
 }
 
-/// Reads the target coffee weight previously stored with
-/// [`write_target_weight`]. Returns `None` if nothing has been stored yet (or
-/// the stored data is corrupt).
-pub fn read_target_weight(flash: &mut FlashStorage) -> Option<f32> {
-    let weight = read_f32(flash, TARGET_WEIGHT_OFFSET, TARGET_WEIGHT_MAGIC)
-        .filter(|weight| weight.is_finite());
-    match weight {
-        Some(weight) => info!("Loaded target weight {}g from flash", weight),
-        None => info!("No target weight stored in flash yet"),
-    }
-    weight
+/// Reads the target coffee weight stored by firmware from before the
+/// portafilter holders. Returns `None` if nothing has been stored (or the
+/// stored data is corrupt).
+pub fn read_legacy_target_weight(flash: &mut FlashStorage) -> Option<f32> {
+    read_f32(flash, TARGET_WEIGHT_OFFSET, TARGET_WEIGHT_MAGIC).filter(|weight| weight.is_finite())
 }
 
-/// Persists `weight` so it can be recovered on the next boot with
-/// [`read_target_weight`]. Returns `false` if writing failed.
-pub fn write_target_weight(flash: &mut FlashStorage, weight: f32) -> bool {
-    let ok = write_f32(flash, TARGET_WEIGHT_OFFSET, TARGET_WEIGHT_MAGIC, weight);
+/// Reads the holder configuration previously stored with
+/// [`write_holder_config`]. Returns `None` if nothing has been stored yet (or
+/// the stored data is corrupt).
+pub fn read_holder_config(flash: &mut FlashStorage) -> Option<HolderConfig> {
+    let config = read_f32s(flash, HOLDERS_OFFSET, HOLDERS_MAGIC).map(
+        |[single_weight, single_target, double_weight, double_target]| HolderConfig {
+            single: Holder {
+                weight: single_weight,
+                target: single_target,
+            },
+            double: Holder {
+                weight: double_weight,
+                target: double_target,
+            },
+        },
+    );
+    match config {
+        Some(config) => info!(
+            "Loaded holders from flash: single {}g -> {}g, double {}g -> {}g",
+            config.single.weight, config.single.target, config.double.weight, config.double.target
+        ),
+        None => info!("No holders stored in flash yet"),
+    }
+    config
+}
+
+/// Persists `config` so it can be recovered on the next boot with
+/// [`read_holder_config`]. Returns `false` if writing failed.
+pub fn write_holder_config(flash: &mut FlashStorage, config: &HolderConfig) -> bool {
+    let values = [
+        config.single.weight,
+        config.single.target,
+        config.double.weight,
+        config.double.target,
+    ];
+    let ok = write_f32s(flash, HOLDERS_OFFSET, HOLDERS_MAGIC, &values);
     if ok {
-        info!("Stored target weight {}g to flash", weight);
+        info!("Stored holders to flash");
     }
     ok
 }

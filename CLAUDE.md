@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Grindy is an automated coffee grinder controller for Raspberry Pi Pico 2 (RP2350) written in embedded Rust. It uses a load cell (HX711) to measure coffee weight in real-time and automatically controls grinding to achieve a target weight (18g by default).
+Grindy is an automated coffee grinder controller for Raspberry Pi Pico 2 (RP2350) written in embedded Rust. It uses a load cell (HX711) to measure coffee weight in real-time and automatically controls grinding to achieve a target weight. It tells two portafilter
+holders (single and double shot) apart by their weight, each with its own target
+(9g / 18g by default).
 
 ## Hardware Platform
 
@@ -85,7 +87,8 @@ The controller implements a state machine in `src/scale.rs` with these states:
 - **WaitingForCalibration**: Waits for known calibration weight (200g)
 - **Calibrating**: Determines scale factor (200 samples)
 - **WaitingForPortafilter**: Idle, waiting for portafilter placement
-- **Stabilizing**: Ensures weight is stable before grinding (2s window)
+- **Stabilizing**: Ensures weight is stable before grinding (2s window), then
+  selects the holder (see below) whose target the grind uses
 - **Grinding**: Active grinding until the grind estimator predicts the target,
   the raw weight reaches it, or the safety timeout fires
 - **WaitingForRemoval**: Grinding complete; measures the settled weight and
@@ -147,9 +150,12 @@ calibration sector, see `src/storage.rs`) and set via `POST /wifi` from the web 
 - Saving new credentials stores them and makes `network_task` reconnect.
 - `GET /wifi` returns the current mode and SSID as JSON.
 
-Flash also stores the calibration factor, the target weight, and the
-learned lead time, each in its own sector (`src/storage.rs`); the lead-time
-sector follows the target-weight sector (magic `0x6772_7461`, "grta").
+Flash also stores the calibration factor, the learned lead time, and the
+portafilter holders, each in its own sector (`src/storage.rs`); the lead-time
+sector follows the (legacy) target-weight sector (magic `0x6772_7461`, "grta"),
+the holder sector follows the lead-time one (magic `0x6772_6870`, "grhp"). The
+legacy target-weight sector is only read as the double holder's default target
+until holders are stored.
 
 ### Hardware Pins
 
@@ -179,8 +185,17 @@ Uses `defmt` for efficient embedded logging:
 ## Important Constants
 
 In `src/scale.rs` (`GrinderStateMachine` and its `update_weight()`):
-- Target coffee weight: 18.0g default (`DEFAULT_TARGET_WEIGHT`), configurable 1-100g via
-  `POST /target-weight` from the web page and stored in flash (sector after the WiFi one)
+- Portafilter holders (`HolderConfig`: single and double, each a rough empty
+  holder weight and a coffee target): set via `POST /holders` (form fields
+  `single_weight`, `single_target`, `double_weight`, `double_target`; holder
+  weights 100-2000g, targets 1-100g) from the web page, read via `GET /holders`
+  (JSON), stored in flash. Once stabilized, `select_holder()` picks the holder
+  on the same side of the midpoint between both holder weights as the
+  portafilter weight (double if both weigh the same, e.g. before configuring).
+  Defaults: 9g single (`DEFAULT_SINGLE_TARGET_WEIGHT`), 18g double
+  (`DEFAULT_DOUBLE_TARGET_WEIGHT`). The `target_weight` in WebSocket messages
+  is the selected (or last selected) holder's target; `TargetWeightChanged` is
+  broadcast after `POST /holders`, and pages then reload `/holders`
 - `PORTAFILTER_THRESHOLD`: 100.0g (detection threshold)
 - `REMOVAL_THRESHOLD`: 10.0g
 - Stabilizing window: `SAMPLE_COUNT` = 15 samples (~1.4s at the HX711's
@@ -211,7 +226,7 @@ These are loaded at runtime in `main()` in `src/main.rs`.
   machine and `controller_task`
 - `src/web.rs`: HTTP/WebSocket server, `WsMessage` wire format, broadcaster task
 - `src/ui.rs`: LED (status) and LED strip (grind progress) tasks
-- `src/storage.rs`: flash-backed calibration factor, target weight, WiFi
+- `src/storage.rs`: flash-backed calibration factor, portafilter holders, WiFi
   credentials and lead time
 - `src/wifi.rs`: WiFi join/AP-fallback logic (`network_task`)
 - `grindy-gp/`: `no_std` grind estimator crate (GP/Kalman filter, lead-time logic, fitted constants)

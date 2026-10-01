@@ -9,7 +9,7 @@ use loadcell::{hx711::GainMode, LoadCell};
 use num_traits::float::FloatCore;
 use serde::Serialize;
 
-use crate::storage::{self, SharedFlash};
+use crate::storage::{self, Holder, HolderConfig, SharedFlash};
 use crate::ui::{UserEvent, GRIND_PROGRESS_CHANNEL_SIZE, USER_EVENT_CHANNEL_SIZE};
 
 pub const CONTROLLER_EVENT_CHANNEL_SIZE: usize = 4;
@@ -248,8 +248,9 @@ pub struct GrinderStateMachine {
     grinder: Output<'static>,
     flash: SharedFlash,
     scale_setting: ScaleSetting,
-    /// Coffee weight in grams to grind to.
-    target_weight: f32,
+    holders: HolderConfig,
+    /// Holder of the current (or last) grind.
+    selected: HolderKind,
     /// Seconds of flow still arriving after the grinder stops.
     lead_time: f32,
     /// Lead time last persisted to flash.
@@ -257,12 +258,48 @@ pub struct GrinderStateMachine {
     state: Option<GrinderState>,
 }
 
-/// Target coffee weight in grams used until one is stored in flash.
-const DEFAULT_TARGET_WEIGHT: f32 = 18.0;
+/// Target coffee weights in grams used until holders are stored in flash.
+const DEFAULT_SINGLE_TARGET_WEIGHT: f32 = 9.0;
+const DEFAULT_DOUBLE_TARGET_WEIGHT: f32 = 18.0;
 
 /// Range of accepted target coffee weights in grams.
-pub const MIN_TARGET_WEIGHT: f32 = 1.0;
-pub const MAX_TARGET_WEIGHT: f32 = 100.0;
+const MIN_TARGET_WEIGHT: f32 = 1.0;
+const MAX_TARGET_WEIGHT: f32 = 100.0;
+
+/// Minimum weight in grams to detect portafilter placement.
+const PORTAFILTER_THRESHOLD: f32 = 100.0;
+
+/// Largest accepted holder weight in grams.
+const MAX_HOLDER_WEIGHT: f32 = 2000.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Format)]
+pub enum HolderKind {
+    Single,
+    Double,
+}
+
+/// Whether `config` has holder weights the scale can detect and sensible
+/// target weights.
+fn is_valid_holder_config(config: &HolderConfig) -> bool {
+    [config.single, config.double].iter().all(|holder| {
+        (PORTAFILTER_THRESHOLD..=MAX_HOLDER_WEIGHT).contains(&holder.weight)
+            && (MIN_TARGET_WEIGHT..=MAX_TARGET_WEIGHT).contains(&holder.target)
+    })
+}
+
+/// Picks the holder whose weight is on the same side as `portafilter_weight`
+/// of the midpoint between both holder weights. Falls back to the double
+/// holder if both weigh the same.
+fn select_holder(config: &HolderConfig, portafilter_weight: f32) -> HolderKind {
+    let midpoint = (config.single.weight + config.double.weight) / 2.0;
+    let heavier_is_single = config.single.weight > config.double.weight;
+    let is_heavier = portafilter_weight >= midpoint;
+    if config.single.weight != config.double.weight && is_heavier == heavier_is_single {
+        HolderKind::Single
+    } else {
+        HolderKind::Double
+    }
+}
 
 /// Factor derived from a manual calibration against a known weight, used
 /// until a calibration is stored in flash.
@@ -285,10 +322,11 @@ pub enum CalibrationError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Format)]
-pub enum TargetWeightError {
-    /// The weight is outside [`MIN_TARGET_WEIGHT`]..=[`MAX_TARGET_WEIGHT`].
+pub enum HolderConfigError {
+    /// A holder weight is outside [`PORTAFILTER_THRESHOLD`]..=[`MAX_HOLDER_WEIGHT`]
+    /// or a target weight outside [`MIN_TARGET_WEIGHT`]..=[`MAX_TARGET_WEIGHT`].
     OutOfRange,
-    /// Persisting the weight to flash failed.
+    /// Persisting the configuration to flash failed.
     Storage,
 }
 
@@ -326,17 +364,35 @@ impl GrinderStateMachine {
         let factor = flash
             .lock(|flash| storage::read_calibration_factor(&mut flash.borrow_mut()))
             .unwrap_or(DEFAULT_FACTOR);
-        let target_weight = flash
-            .lock(|flash| storage::read_target_weight(&mut flash.borrow_mut()))
-            .filter(|weight| (MIN_TARGET_WEIGHT..=MAX_TARGET_WEIGHT).contains(weight))
-            .unwrap_or(DEFAULT_TARGET_WEIGHT);
+        let holders = flash
+            .lock(|flash| storage::read_holder_config(&mut flash.borrow_mut()))
+            .filter(is_valid_holder_config)
+            .unwrap_or_else(|| {
+                // Holder weights are unknown until configured; equal weights
+                // always select the double holder.
+                let double_target = flash
+                    .lock(|flash| storage::read_legacy_target_weight(&mut flash.borrow_mut()))
+                    .filter(|weight| (MIN_TARGET_WEIGHT..=MAX_TARGET_WEIGHT).contains(weight))
+                    .unwrap_or(DEFAULT_DOUBLE_TARGET_WEIGHT);
+                HolderConfig {
+                    single: Holder {
+                        weight: 0.0,
+                        target: DEFAULT_SINGLE_TARGET_WEIGHT,
+                    },
+                    double: Holder {
+                        weight: 0.0,
+                        target: double_target,
+                    },
+                }
+            });
         let lead_time = flash
             .lock(|flash| storage::read_lead_time(&mut flash.borrow_mut()))
             .unwrap_or(DEFAULT_LEAD_TIME);
         Self {
             grinder,
             flash,
-            target_weight,
+            holders,
+            selected: HolderKind::Double,
             lead_time,
             stored_lead_time: lead_time,
             scale_setting: ScaleSetting {
@@ -407,8 +463,16 @@ impl GrinderStateMachine {
         &self.scale_setting
     }
 
+    /// Coffee weight in grams to grind to for the current (or last) holder.
     pub fn get_target_weight(&self) -> f32 {
-        self.target_weight
+        match self.selected {
+            HolderKind::Single => self.holders.single.target,
+            HolderKind::Double => self.holders.double.target,
+        }
+    }
+
+    pub fn get_holder_config(&self) -> &HolderConfig {
+        &self.holders
     }
 
     pub fn get_lead_time(&self) -> f32 {
@@ -421,20 +485,24 @@ impl GrinderStateMachine {
         math::sqrt(1.0 / self.scale_setting.inv_variance * self.scale_setting.factor.powi(2)) * 3.0
     }
 
-    /// Sets the coffee weight in grams to grind to and persists it. Takes
-    /// effect immediately, even during a running grind.
-    pub fn set_target_weight(&mut self, weight: f32) -> Result<(), TargetWeightError> {
-        if !(MIN_TARGET_WEIGHT..=MAX_TARGET_WEIGHT).contains(&weight) {
-            return Err(TargetWeightError::OutOfRange);
+    /// Sets the portafilter holders and persists them. A changed target
+    /// weight of the current holder takes effect immediately, even during a
+    /// running grind.
+    pub fn set_holder_config(&mut self, config: HolderConfig) -> Result<(), HolderConfigError> {
+        if !is_valid_holder_config(&config) {
+            return Err(HolderConfigError::OutOfRange);
         }
         if !self
             .flash
-            .lock(|flash| storage::write_target_weight(&mut flash.borrow_mut(), weight))
+            .lock(|flash| storage::write_holder_config(&mut flash.borrow_mut(), &config))
         {
-            return Err(TargetWeightError::Storage);
+            return Err(HolderConfigError::Storage);
         }
-        info!("Target weight set to {}g", weight);
-        self.target_weight = weight;
+        info!(
+            "Holders set: single {}g -> {}g, double {}g -> {}g",
+            config.single.weight, config.single.target, config.double.weight, config.double.target
+        );
+        self.holders = config;
         Ok(())
     }
 
@@ -459,7 +527,7 @@ impl GrinderStateMachine {
             {
                 Some((
                     estimator.weight().mean,
-                    lead_time::stop_eta(estimator, self.lead_time, self.target_weight),
+                    lead_time::stop_eta(estimator, self.lead_time, self.get_target_weight()),
                 ))
             }
             _ => None,
@@ -521,8 +589,6 @@ impl GrinderStateMachine {
     }
 
     fn update_weight(&mut self, time: Instant, raw_weight: f32) -> Option<GrindFinished> {
-        // Minimum weight to detect portafilter placement.
-        const PORTAFILTER_THRESHOLD: f32 = 100.0;
         // Weight below which we consider portafilter removed.
         const REMOVAL_THRESHOLD: f32 = 10.0;
 
@@ -655,7 +721,13 @@ impl GrinderStateMachine {
                     }
                 } else if samples.is_full() {
                     // TODO(mkiefel): Make this dependent on sample count.
-                    info!("Weight stabilized at {}g - starting grind!", weight);
+                    self.selected = select_holder(&self.holders, portafilter_weight);
+                    info!(
+                        "Weight stabilized at {}g - {} holder, starting grind to {}g!",
+                        portafilter_weight,
+                        self.selected,
+                        self.get_target_weight()
+                    );
                     self.grinder.set_low();
                     GrinderState::Grinding {
                         start_time: time,
@@ -689,10 +761,10 @@ impl GrinderStateMachine {
                     &estimator,
                     t,
                     self.lead_time,
-                    self.target_weight,
+                    self.get_target_weight(),
                 ) {
                     Some(StopReason::Prediction)
-                } else if coffee_weight >= self.target_weight {
+                } else if coffee_weight >= self.get_target_weight() {
                     Some(StopReason::RawWeight)
                 } else if elapsed >= Duration::from_secs(MAX_GRIND_TIME_IN_SECS as u64) {
                     Some(StopReason::Timeout)
